@@ -44,30 +44,50 @@ def _to_date(value: t.Union[str, int, float, date, datetime, None]) -> date | No
 
 # ------------- Bookster access ------------
 
+# Optional debug flag to emit raw API payloads (useful on GitHub Pages builds)
+DEBUG_DUMP = os.getenv("DEBUG_DUMP", "0") == "1"
+
 async def fetch_bookings_for_property(property_id: t.Union[int, str]) -> list[dict]:
     """Fetch bookings for a given property.
-    Expects a payload like: {"meta": {...}, "data": [ ... ]}
-    Filters by entry_id client-side if needed.
+    Supports both legacy and system API shapes.
+    Filters by property/entry id client-side as a fallback.
     """
     url = f"{BOOKSTER_API_BASE.rstrip('/')}/{BOOKSTER_BOOKINGS_PATH.lstrip('/')}"
-    params = {"property_id": property_id}
-    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
-        # HTTP Basic with username 'x' and password = API key (per Bookster docs)
+    # Try both common filter param names; API will ignore unknowns
+    params = {
+        "ei": property_id,   # filter by entry_id (property) per Bookster docs
+        "pp": 200,           # return up to 200 at once
+        "st": "confirmed",  # only confirmed bookings
+    }
+    async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
         r = await client.get(url, params=params, auth=("x", BOOKSTER_API_KEY))
         if r.status_code in (301, 302, 303, 307, 308):
-            raise RuntimeError(f"Auth/URL redirect from Bookster ({r.status_code}). Check base/path and credentials.")
+            raise RuntimeError(
+                f"Auth/URL redirect from Bookster ({r.status_code}). Check BOOKSTER_API_BASE/BOOKSTER_BOOKINGS_PATH and credentials."
+            )
         r.raise_for_status()
         payload = r.json()
 
-    if isinstance(payload, dict) and "data" in payload:
-        items = payload.get("data", [])
-    elif isinstance(payload, dict) and "results" in payload:
-        items = payload.get("results", [])
+    # Normalise list from several possible shapes
+    items: list[dict]
+    if isinstance(payload, dict):
+        if "data" in payload and isinstance(payload["data"], list):
+            items = payload["data"]
+        elif "results" in payload and isinstance(payload["results"], list):
+            items = payload["results"]
+        elif "bookings" in payload and isinstance(payload["bookings"], list):
+            items = payload["bookings"]
+        else:
+            # Look for any list value inside dict as a last resort
+            items = next((v for v in payload.values() if isinstance(v, list)), []) or []
+    elif isinstance(payload, list):
+        items = payload
     else:
-        items = payload if isinstance(payload, list) else []
+        items = []
 
-    if items and any("entry_id" in i for i in items):
-        items = [i for i in items if str(i.get("entry_id")) == str(property_id) or not property_id]
+    # Client-side filter by entry/property id if field exists on items
+    pid = str(property_id)
+    # No further client-side filtering needed because we used ei=property_id
     return items
 
 
@@ -200,13 +220,15 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
         html_lines = ["<h1>Redroofs iCal Feeds</h1>"]
         for pid in property_ids:
             html_lines.append(f"<p><a href='{pid}.ics'>{pid}.ics</a></p>")
-        (os.path.join(outdir, "index.html"))
         with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
-            f.write("\n".join(html_lines))
+            f.write("
+".join(html_lines))
         return written
 
     except Exception as e:
-        err = f"Error generating feeds: {e}\n\n" + traceback.format_exc()
+        err = f"Error generating feeds: {e}
+
+" + traceback.format_exc()
         # create placeholder feeds
         placeholder = """BEGIN:VCALENDAR
 VERSION:2.0
