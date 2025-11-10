@@ -2,26 +2,28 @@ name: Build iCal feeds hourly
 
 on:
   schedule:
-    - cron: "0 * * * *"  # hourly (UTC)
+    - cron: "0 * * * *"   # hourly, UTC
   workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install httpx icalendar python-dateutil python-dotenv
+          pip install httpx icalendar python-dateutil
 
       - name: Generate .ics files
         env:
@@ -30,17 +32,33 @@ jobs:
           BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
         run: |
           python - << 'PY'
-          import os, asyncio, pathlib
+          import os, asyncio
+          from pathlib import Path
           from app import generate_and_write
-          outdir = pathlib.Path("public")
-          outdir.mkdir(parents=True, exist_ok=True)
-          props = ["158595","158596","158497"]
-          asyncio.run(generate_and_write(props, str(outdir)))
+
+          OUT = Path("public")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          # Your three properties
+          PIDS = ["158595","158596","158497"]
+
+          # Optional: show API errors on index page for debugging
+          os.environ["DEBUG_DUMP"] = "1"
+
+          asyncio.run(generate_and_write(PIDS, str(OUT)))
           PY
 
-      - name: Deploy to GitHub Pages (gh-pages branch)
-        uses: peaceiris/actions-gh-pages@v3
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./public
-          # Optional: force_orphan: true  # uncomment if the branch history gets messy
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
