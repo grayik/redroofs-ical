@@ -1,0 +1,59 @@
+name: Build iCal feeds hourly
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # hourly, UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate .ics files
+        env:
+          BOOKSTER_API_BASE: ${{ secrets.BOOKSTER_API_BASE }}
+          BOOKSTER_API_KEY:  ${{ secrets.BOOKSTER_API_KEY }}
+        run: |
+          python - << 'PY'
+          import os, asyncio
+          from pathlib import Path
+          from app import generate_and_write
+          OUT = Path("public"); OUT.mkdir(parents=True, exist_ok=True)
+
+          PROPS = {
+            "158595": "Barn Owl Cabin",
+            "158596": "Redroofs by the Woods",
+            "158497": "Bumblebee Cabin",
+          }
+
+          paths = asyncio.run(generate_and_write(list(PROPS.keys()), str(OUT)))
+
+          (OUT/"CNAME").write_text("redroofs.scot", encoding="utf-8")
+          html = ["<h1>Redroofs iCal feeds</h1>"]
+          for pid, name in PROPS.items():
+            html.append(f"<p><a href='{pid}.ics'>{name}</a></p>")
+          (OUT/"index.html").write_text("\n".join(html), encoding="utf-8")
+          PY
+
+      - name: Deploy to gh-pages
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: gh-pages
+          folder: public
+          clean: true
+          single-commit: true
+          cname: redroofs.scot
