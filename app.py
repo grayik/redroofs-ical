@@ -35,7 +35,8 @@ def _to_date(value):
 
 async def fetch_bookings_for_property(property_id):
     url = BOOKSTER_API_BASE.rstrip("/") + "/" + BOOKSTER_BOOKINGS_PATH.lstrip("/")
-    params = {"ei": property_id, "pp": 200, "st": "confirmed"}
+#    params = {"ei": property_id, "pp": 200, "st": "confirmed"}
+    params = {"ei": property_id, "pp": 200}
     async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
         r = await client.get(url, params=params, auth=("x", BOOKSTER_API_KEY))
         if r.status_code in (301, 302, 303, 307, 308):
