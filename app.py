@@ -202,13 +202,11 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
             html_lines.append(f"<p><a href='{pid}.ics'>{pid}.ics</a></p>")
         (os.path.join(outdir, "index.html"))
         with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
-            f.write("".join(html_lines))
+            f.write("\n".join(html_lines))
         return written
 
     except Exception as e:
-        err = f"Error generating feeds: {e}
-
-" + traceback.format_exc()
+        err = f"Error generating feeds: {e}\n\n" + traceback.format_exc()
         # create placeholder feeds
         placeholder = """BEGIN:VCALENDAR
 VERSION:2.0
