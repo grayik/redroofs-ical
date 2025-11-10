@@ -2,21 +2,23 @@ name: Build iCal feeds hourly
 
 on:
   schedule:
-    - cron: "0 * * * *"   # hourly, UTC
+    - cron: "0 * * * *"   # hourly (UTC)
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
+  pages: write       # to deploy to GitHub Pages
+  id-token: write    # to verify the deployment originates from this repo
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -30,8 +32,6 @@ jobs:
           BOOKSTER_API_BASE: https://api.booksterhq.com/system/api/v1
           BOOKSTER_BOOKINGS_PATH: booking/bookings.json
           BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
-          # Optional: set this if your tenant requires scoping to your client id
-          # BOOKSTER_CLIENT_ID: ${{ secrets.BOOKSTER_CLIENT_ID }}
           DEBUG_DUMP: "1"
         run: |
           python - << 'PY'
@@ -54,5 +54,6 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - id: deployment
+      - name: Deploy to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v4
