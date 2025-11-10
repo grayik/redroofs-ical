@@ -30,22 +30,29 @@ jobs:
           BOOKSTER_API_BASE: https://api.booksterhq.com/system/api/v1
           BOOKSTER_BOOKINGS_PATH: booking/bookings.json
           BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
+          DEBUG_DUMP: "1"
         run: |
           python - << 'PY'
-          import os, asyncio
-          from pathlib import Path
+          import os, asyncio, httpx
           from app import generate_and_write
 
-          OUT = Path("public")
-          OUT.mkdir(parents=True, exist_ok=True)
-
-          # Your three properties
-          PIDS = ["158595","158596","158497"]
-
-          # Optional: show API errors on index page for debugging
-          os.environ["DEBUG_DUMP"] = "1"
-
-          asyncio.run(generate_and_write(PIDS, str(OUT)))
+          # Quick sanity check: print meta for each property
+          async def ping(pid):
+            url = os.environ.get("BOOKSTER_API_BASE").rstrip("/") + "/" + os.environ.get("BOOKSTER_BOOKINGS_PATH").lstrip("/")
+            params = {"ei": pid, "pp": 5, "st": "confirmed"}
+            async with httpx.AsyncClient(timeout=30) as c:
+              r = await c.get(url, params=params, auth=("x", os.environ["BOOKSTER_API_KEY"]))
+              r.raise_for_status()
+              js = r.json()
+              if isinstance(js, dict) and "meta" in js:
+                print(f"PID {pid}: meta={js['meta']}")
+              else:
+                print(f"PID {pid}: received type={type(js).__name__}")
+          async def main():
+            for pid in ["158595","158596","158497"]:
+              await ping(pid)
+            await generate_and_write(["158595","158596","158497"], "public")
+          asyncio.run(main())
           PY
 
       - name: Upload artifact
