@@ -20,9 +20,9 @@ BOOKSTER_API_KEY = os.getenv("BOOKSTER_API_KEY", "")
 # ----------------- helpers -----------------
 
 def _auth_headers() -> dict:
-    if not BOOKSTER_API_KEY:
-        return {}
-    return {"X-API-Key": BOOKSTER_API_KEY}
+    # Using HTTP Basic with API key (per Bookster developer docs)
+    # We'll set auth via httpx 'auth=(api_key, "")', so no header needed here.
+    return {}
 
 
 def _to_date(value: t.Union[str, int, float, date, datetime, None]) -> date | None:
@@ -52,7 +52,8 @@ async def fetch_bookings_for_property(property_id: t.Union[int, str]) -> list[di
     url = f"{BOOKSTER_API_BASE}/bookings"
     params = {"property_id": property_id}
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, params=params, headers=_auth_headers())
+        # Authenticate with HTTP Basic using the API key as the username, blank password
+        r = await client.get(url, params=params, headers=_auth_headers(), auth=(BOOKSTER_API_KEY, ""))
         r.raise_for_status()
         payload = r.json()
 
