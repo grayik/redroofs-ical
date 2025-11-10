@@ -2,80 +2,45 @@ name: Build iCal feeds hourly
 
 on:
   schedule:
-    - cron: "0 * * * *"   # hourly, UTC
+    - cron: "0 * * * *"  # hourly (UTC)
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install httpx icalendar python-dateutil
-
-      # ---- Sanity check: call Bookster directly ----
-      - name: Sanity check Bookster API (entry 158595)
-        env:
-          BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
-        run: |
-          set -e
-          echo "Testing GET https://api.booksterhq.com/system/api/v1/booking/bookings.json?ei=158595&pp=1&st=confirmed"
-          curl -sS -u "x:${BOOKSTER_API_KEY}" \
-            "https://api.booksterhq.com/system/api/v1/booking/bookings.json?ei=158595&pp=1&st=confirmed" \
-            -o check.json
-          # Print top-level keys + first item for visibility
-          python - << 'PY'
-          import json
-          d=json.load(open("check.json"))
-          if isinstance(d, dict):
-            print("meta:", d.get("meta"))
-            data=d.get("data") or d.get("results")
-            print("data_count:", len(data) if isinstance(data, list) else 0)
-            if isinstance(data, list) and data:
-              print("sample_id:", data[0].get("id"), "state:", data[0].get("state"), "entry_id:", data[0].get("entry_id"))
-          else:
-            print("top_type:", type(d).__name__, "len:", len(d) if hasattr(d, "__len__") else "?")
-          PY
+          pip install httpx icalendar python-dateutil python-dotenv
 
       - name: Generate .ics files
         env:
-          BOOKSTER_API_BASE:   https://api.booksterhq.com/system/api/v1
+          BOOKSTER_API_BASE: https://api.booksterhq.com/system/api/v1
           BOOKSTER_BOOKINGS_PATH: booking/bookings.json
-          BOOKSTER_API_KEY:    ${{ secrets.BOOKSTER_API_KEY }}
-          DEBUG_DUMP:          "1"
+          BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
         run: |
           python - << 'PY'
-          import os, asyncio
-          from pathlib import Path
+          import os, asyncio, pathlib
           from app import generate_and_write
-          OUT = Path("public"); OUT.mkdir(parents=True, exist_ok=True)
+          outdir = pathlib.Path("public")
+          outdir.mkdir(parents=True, exist_ok=True)
           props = ["158595","158596","158497"]
-          print("Generating feeds for:", props)
-          asyncio.run(generate_and_write(props, str(OUT)))
-          print("Done.")
+          asyncio.run(generate_and_write(props, str(outdir)))
           PY
 
-      - name: Publish to gh-pages
-        run: |
-          set -e
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin gh-pages || true
-          rm -rf gh-pages
-          git worktree add -B gh-pages gh-pages origin/gh-pages || git worktree add -B gh-pages gh-pages
-          rsync -av --delete public/ gh-pages/
-          cd gh-pages
-          git add .
-          git commit -m "Update iCal feeds" || echo "No changes"
-          git push origin gh-pages
+      - name: Deploy to GitHub Pages (gh-pages branch)
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          # Optional: force_orphan: true  # uncomment if the branch history gets messy
