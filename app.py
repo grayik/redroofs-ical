@@ -14,14 +14,14 @@ import httpx
 from icalendar import Calendar, Event
 from dateutil import parser as dtparse
 
-BOOKSTER_API_BASE = os.getenv("BOOKSTER_API_BASE", "https://app.booksterhq.com/api")
+BOOKSTER_API_BASE = os.getenv("BOOKSTER_API_BASE", "https://api.booksterhq.com/system/api/v1")
+BOOKSTER_BOOKINGS_PATH = os.getenv("BOOKSTER_BOOKINGS_PATH", "booking/bookings.json")
 BOOKSTER_API_KEY = os.getenv("BOOKSTER_API_KEY", "")
 
 # ----------------- helpers -----------------
 
 def _auth_headers() -> dict:
-    # Using HTTP Basic with API key (per Bookster developer docs)
-    # We'll set auth via httpx 'auth=(api_key, "")', so no header needed here.
+    # Not used for Basic auth; kept for future header-based auth if needed.
     return {}
 
 
@@ -49,11 +49,13 @@ async def fetch_bookings_for_property(property_id: t.Union[int, str]) -> list[di
     Expects a payload like: {"meta": {...}, "data": [ ... ]}
     Filters by entry_id client-side if needed.
     """
-    url = f"{BOOKSTER_API_BASE}/bookings"
+    url = f"{BOOKSTER_API_BASE.rstrip('/')}/{BOOKSTER_BOOKINGS_PATH.lstrip('/')}"
     params = {"property_id": property_id}
-    async with httpx.AsyncClient(timeout=30) as client:
-        # Authenticate with HTTP Basic using the API key as the username, blank password
-        r = await client.get(url, params=params, headers=_auth_headers(), auth=(BOOKSTER_API_KEY, ""))
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+        # HTTP Basic with username 'x' and password = API key (per Bookster docs)
+        r = await client.get(url, params=params, auth=("x", BOOKSTER_API_KEY))
+        if r.status_code in (301, 302, 303, 307, 308):
+            raise RuntimeError(f"Auth/URL redirect from Bookster ({r.status_code}). Check base/path and credentials.")
         r.raise_for_status()
         payload = r.json()
 
