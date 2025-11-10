@@ -1,3 +1,6 @@
 httpx
 icalendar
 python-dateutil
+python-dotenv
+fastapi
+uvicorn
