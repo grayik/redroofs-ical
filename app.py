@@ -14,16 +14,16 @@ import httpx
 from icalendar import Calendar, Event
 from dateutil import parser as dtparse
 
+# ================= Configuration =================
+# Per Bookster docs: https://api.booksterhq.com/system/api/v1/booking/bookings.json
 BOOKSTER_API_BASE = os.getenv("BOOKSTER_API_BASE", "https://api.booksterhq.com/system/api/v1")
 BOOKSTER_BOOKINGS_PATH = os.getenv("BOOKSTER_BOOKINGS_PATH", "booking/bookings.json")
 BOOKSTER_API_KEY = os.getenv("BOOKSTER_API_KEY", "")
 
-# ----------------- helpers -----------------
+# Optional: write debug info on index.html when set to "1"
+DEBUG_DUMP = os.getenv("DEBUG_DUMP", "0") == "1"
 
-def _auth_headers() -> dict:
-    # Not used for Basic auth; kept for future header-based auth if needed.
-    return {}
-
+# ================= Helpers =================
 
 def _to_date(value: t.Union[str, int, float, date, datetime, None]) -> date | None:
     if value is None:
@@ -42,53 +42,41 @@ def _to_date(value: t.Union[str, int, float, date, datetime, None]) -> date | No
     except Exception:
         return None
 
-# ------------- Bookster access ------------
-
-# Optional debug flag to emit raw API payloads (useful on GitHub Pages builds)
-DEBUG_DUMP = os.getenv("DEBUG_DUMP", "0") == "1"
+# ================= Bookster access =================
 
 async def fetch_bookings_for_property(property_id: t.Union[int, str]) -> list[dict]:
-    """Fetch bookings for a given property.
-    Supports both legacy and system API shapes.
-    Filters by property/entry id client-side as a fallback.
+    """Fetch confirmed bookings for a given entry/property.
+
+    Uses Basic auth with username 'x' and password = API key (per Bookster docs).
+    Filters by entry with `ei` parameter and returns up to 200 results.
     """
     url = f"{BOOKSTER_API_BASE.rstrip('/')}/{BOOKSTER_BOOKINGS_PATH.lstrip('/')}"
-    # Try both common filter param names; API will ignore unknowns
     params = {
-        "ei": property_id,   # filter by entry_id (property) per Bookster docs
-        "pp": 200,           # return up to 200 at once
-        "st": "confirmed",  # only confirmed bookings
+        "ei": property_id,   # entry_id
+        "pp": 200,           # page size
+        "st": "confirmed",  # only confirmed
     }
     async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
         r = await client.get(url, params=params, auth=("x", BOOKSTER_API_KEY))
         if r.status_code in (301, 302, 303, 307, 308):
             raise RuntimeError(
-                f"Auth/URL redirect from Bookster ({r.status_code}). Check BOOKSTER_API_BASE/BOOKSTER_BOOKINGS_PATH and credentials."
+                f"Unexpected redirect from Bookster ({r.status_code}). Check BOOKSTER_API_BASE/BOOKSTER_BOOKINGS_PATH and credentials."
             )
         r.raise_for_status()
         payload = r.json()
 
-    # Normalise list from several possible shapes
-    items: list[dict]
-    if isinstance(payload, dict):
-        if "data" in payload and isinstance(payload["data"], list):
-            items = payload["data"]
-        elif "results" in payload and isinstance(payload["results"], list):
-            items = payload["results"]
-        elif "bookings" in payload and isinstance(payload["bookings"], list):
-            items = payload["bookings"]
-        else:
-            # Look for any list value inside dict as a last resort
-            items = next((v for v in payload.values() if isinstance(v, list)), []) or []
+    # Normalise list
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        items = payload["data"]
+    elif isinstance(payload, dict) and isinstance(payload.get("results"), list):
+        items = payload["results"]
     elif isinstance(payload, list):
         items = payload
     else:
-        items = []
+        # Try any list value
+        items = next((v for v in (payload or {}).values() if isinstance(v, list)), [])
 
-    # Client-side filter by entry/property id if field exists on items
-    pid = str(property_id)
-    # No further client-side filtering needed because we used ei=property_id
-    return items
+    return items or []
 
 
 def map_booking_to_event_data(b: dict) -> dict | None:
@@ -128,16 +116,15 @@ def map_booking_to_event_data(b: dict) -> dict | None:
     if value is not None and balance is not None:
         paid = max(0.0, value - balance)
 
-    extras_raw = b.get("extras") or b.get("add_ons") or []
+    # extras from lines[] of type "extra" if present
     extras_list: list[str] = []
-    if isinstance(extras_raw, list):
-        for x in extras_raw:
-            if isinstance(x, str):
-                extras_list.append(x)
-            elif isinstance(x, dict):
-                name = x.get("name") or x.get("title") or x.get("code")
-                qty = x.get("quantity") or x.get("qty")
-                extras_list.append(f"{name} x{qty}" if (name and qty) else (name or "Extra"))
+    lines = b.get("lines")
+    if isinstance(lines, list):
+        for ln in lines:
+            if isinstance(ln, dict) and ln.get("type") == "extra":
+                name = ln.get("name") or ln.get("title") or "Extra"
+                qty = ln.get("quantity") or ln.get("qty")
+                extras_list.append(f"{name} x{qty}" if qty else name)
 
     return {
         "arrival": arrival,
@@ -155,7 +142,7 @@ def map_booking_to_event_data(b: dict) -> dict | None:
         "paid": paid,
     }
 
-# ------------- iCal rendering ------------
+# ================= iCal rendering =================
 
 def render_calendar(bookings: list[dict], property_name: str | None = None) -> bytes:
     cal = Calendar()
@@ -172,9 +159,9 @@ def render_calendar(bookings: list[dict], property_name: str | None = None) -> b
         ev.add("summary", mapped["guest_name"])  # title = guest name
         ev.add("dtstart", mapped["arrival"])     # all-day
         ev.add("dtend", mapped["departure"])     # checkout (non-inclusive)
-        uid = f"redroofs-{mapped.get('reference') or mapped['guest_name']}-{mapped['arrival'].isoformat()}"
+        uid = f"redroofs-{(mapped.get('reference') or mapped['guest_name'])}-{mapped['arrival'].isoformat()}"
         ev.add("uid", uid)
-        lines = []
+        lines: list[str] = []
         if mapped.get("email"):
             lines.append(f"Email: {mapped['email']}")
         if mapped.get("mobile"):
@@ -192,28 +179,28 @@ def render_calendar(bookings: list[dict], property_name: str | None = None) -> b
             if mapped.get("currency"):
                 amt = f"{mapped['currency']} {amt}"
             lines.append(f"Amount paid to us: {amt}")
-        ev.add("description", "\n".join(lines) or "Guest booking")
+        ev.add("description", "
+".join(lines) if lines else "Guest booking")
         cal.add_component(ev)
     return cal.to_ical()
 
-# ------------- GitHub Action entry -------
+# ================= GitHub Action entry =================
 
 async def generate_and_write(property_ids: list[str], outdir: str = "public") -> list[str]:
-    """Generate .ics files and index.html; on error, write placeholders with
-    a clear error message to index.html.
+    """Generate .ics files and write index.html.
+    If an error occurs, write placeholder feeds and show the error on index.html.
     """
     import traceback
     os.makedirs(outdir, exist_ok=True)
     written: list[str] = []
     try:
+        # Write one .ics per property
         for pid in property_ids:
             bookings = await fetch_bookings_for_property(pid)
-            # Property name inferred from first booking
             prop_name = None
             for b in bookings:
-                n = b.get("entry_name")
-                if n:
-                    prop_name = n
+                if isinstance(b, dict) and b.get("entry_name"):
+                    prop_name = b.get("entry_name")
                     break
             ics_bytes = render_calendar(bookings, prop_name)
             path = os.path.join(outdir, f"{pid}.ics")
@@ -221,61 +208,36 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
                 f.write(ics_bytes)
             written.append(path)
 
-        # Success index
-        html_lines = ["<h1>Redroofs iCal Feeds</h1>"]
+        # Build index.html
+        html_lines = [
+            "<h1>Redroofs iCal Feeds</h1>",
+            "<p>Feeds below are regenerated hourly.</p>",
+        ]
         for pid in property_ids:
             html_lines.append(f"<p><a href='{pid}.ics'>{pid}.ics</a></p>")
+        if DEBUG_DUMP:
+            html_lines.append("<hr><pre>DEBUG_DUMP is enabled.</pre>")
         with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
             f.write("
 ".join(html_lines))
         return written
 
     except Exception as e:
-        err_msg = f"Error generating feeds: {e}
-
-" + traceback.format_exc()
-        # Placeholder .ics
-        placeholder = "BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Redroofs//EN
-END:VCALENDAR
-"
+        err_text = "Error generating feeds: " + str(e)
+        # Placeholder minimal VCALENDAR (no events) for each property
+        placeholder = "
+".join([
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//Redroofs//EN",
+            "END:VCALENDAR",
+            "",
+        ])
         for pid in property_ids:
             with open(os.path.join(outdir, f"{pid}.ics"), "w", encoding="utf-8") as f:
                 f.write(placeholder)
-        # Error index
+        # index.html with error message
         with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
-            f.write(f"<h1>Redroofs iCal Feeds</h1><pre>{err_msg}</pre>")
-        return written
-    except Exception as e:
-        err = f"Error generating feeds: {e}
-
-" + traceback.format_exc()
-        placeholder = "BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Redroofs//EN
-END:VCALENDAR
-"
-        for pid in property_ids:
-            with open(os.path.join(outdir, f"{pid}.ics"), "w", encoding="utf-8") as f:
-                f.write(placeholder)
-        with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
-            f.write(f"<h1>Redroofs iCal Feeds</h1><pre>{err}</pre>")
-        return written
-
-    except Exception as e:
-        err = f"Error generating feeds: {e}
-
-" + traceback.format_exc()
-        # create placeholder feeds
-        placeholder = """BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Redroofs//EN
-END:VCALENDAR
-"""
-        for pid in property_ids:
-            with open(os.path.join(outdir, f"{pid}.ics"), "w", encoding="utf-8") as f:
-                f.write(placeholder)
-        with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
-            f.write(f"<h1>Redroofs iCal Feeds</h1><pre>{err}</pre>")
+            f.write("<h1>Redroofs iCal Feeds</h1>
+<pre>" + err_text + "</pre>")
         return written
