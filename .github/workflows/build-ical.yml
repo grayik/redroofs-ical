@@ -23,6 +23,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: API sanity check (temporary)
+        env:
+          BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
+        run: |
+          set -e
+          echo "Testing 158595…"
+          curl -sS -u "x:${BOOKSTER_API_KEY}" \
+            "https://api.booksterhq.com/system/api/v1/booking/bookings.json?ei=158595&pp=5" \
+            | head -c 2000 || true
+          echo
+          echo "Testing 158596…"
+          curl -sS -u "x:${BOOKSTER_API_KEY}" \
+            "https://api.booksterhq.com/system/api/v1/booking/bookings.json?ei=158596&pp=5" \
+            | head -c 2000 || true
+          echo
+          echo "Testing 158497…"
+          curl -sS -u "x:${BOOKSTER_API_KEY}" \
+            "https://api.booksterhq.com/system/api/v1/booking/bookings.json?ei=158497&pp=5" \
+            | head -c 2000 || true
+
       - name: Generate .ics files (never fail the build)
         env:
           BOOKSTER_API_BASE: ${{ secrets.BOOKSTER_API_BASE }}
