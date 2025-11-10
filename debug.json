@@ -1,0 +1,43 @@
+{
+  "property_id": "158497",
+  "attempts": [
+    {
+      "attempt": 1,
+      "params": {
+        "ei": "158497",
+        "pp": 200,
+        "st": "confirmed"
+      },
+      "meta": {
+        "count": 0
+      },
+      "count": 0
+    },
+    {
+      "attempt": 2,
+      "params": {
+        "pp": 200,
+        "st": "confirmed"
+      },
+      "meta": {
+        "count": 0
+      },
+      "visible_total": 0,
+      "filtered_for_pid": 0
+    },
+    {
+      "attempt": 3,
+      "params": {
+        "pp": 200
+      },
+      "meta": {
+        "count": 73,
+        "total_count": 73,
+        "page": 1,
+        "total_pages": 1
+      },
+      "visible_total": 73,
+      "filtered_for_pid": 22
+    }
+  ]
+}
