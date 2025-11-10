@@ -199,30 +199,68 @@ def render_calendar(bookings: list[dict], property_name: str | None = None) -> b
 # ------------- GitHub Action entry -------
 
 async def generate_and_write(property_ids: list[str], outdir: str = "public") -> list[str]:
-    """Generate .ics files. If an error occurs, write placeholder feeds and a clear status message."""
+    """Generate .ics files and index.html; on error, write placeholders with
+    a clear error message to index.html.
+    """
     import traceback
     os.makedirs(outdir, exist_ok=True)
     written: list[str] = []
     try:
         for pid in property_ids:
             bookings = await fetch_bookings_for_property(pid)
+            # Property name inferred from first booking
             prop_name = None
             for b in bookings:
-                if b.get("entry_name"):
-                    prop_name = b.get("entry_name")
+                n = b.get("entry_name")
+                if n:
+                    prop_name = n
                     break
             ics_bytes = render_calendar(bookings, prop_name)
             path = os.path.join(outdir, f"{pid}.ics")
             with open(path, "wb") as f:
                 f.write(ics_bytes)
             written.append(path)
-        # success index
+
+        # Success index
         html_lines = ["<h1>Redroofs iCal Feeds</h1>"]
         for pid in property_ids:
             html_lines.append(f"<p><a href='{pid}.ics'>{pid}.ics</a></p>")
         with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
             f.write("
 ".join(html_lines))
+        return written
+
+    except Exception as e:
+        err_msg = f"Error generating feeds: {e}
+
+" + traceback.format_exc()
+        # Placeholder .ics
+        placeholder = "BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Redroofs//EN
+END:VCALENDAR
+"
+        for pid in property_ids:
+            with open(os.path.join(outdir, f"{pid}.ics"), "w", encoding="utf-8") as f:
+                f.write(placeholder)
+        # Error index
+        with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
+            f.write(f"<h1>Redroofs iCal Feeds</h1><pre>{err_msg}</pre>")
+        return written
+    except Exception as e:
+        err = f"Error generating feeds: {e}
+
+" + traceback.format_exc()
+        placeholder = "BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Redroofs//EN
+END:VCALENDAR
+"
+        for pid in property_ids:
+            with open(os.path.join(outdir, f"{pid}.ics"), "w", encoding="utf-8") as f:
+                f.write(placeholder)
+        with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
+            f.write(f"<h1>Redroofs iCal Feeds</h1><pre>{err}</pre>")
         return written
 
     except Exception as e:
