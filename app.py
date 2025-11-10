@@ -1,4 +1,4 @@
-# app.py - minimal and line-break-safe
+# app.py — Bookster -> iCal generator (for GitHub Pages builds)
 
 import os
 import typing as t
@@ -11,11 +11,9 @@ from dateutil import parser as dtparse
 BOOKSTER_API_BASE = os.getenv("BOOKSTER_API_BASE", "https://api.booksterhq.com/system/api/v1")
 BOOKSTER_BOOKINGS_PATH = os.getenv("BOOKSTER_BOOKINGS_PATH", "booking/bookings.json")
 BOOKSTER_API_KEY = os.getenv("BOOKSTER_API_KEY", "")
-
 DEBUG_DUMP = os.getenv("DEBUG_DUMP", "0") == "1"
 
-
-def _to_date(value):
+def _to_date(value: t.Union[str, int, float, date, datetime, None]) -> t.Optional[date]:
     if value is None:
         return None
     if isinstance(value, date) and not isinstance(value, datetime):
@@ -25,35 +23,36 @@ def _to_date(value):
     if isinstance(value, (int, float)):
         try:
             return datetime.utcfromtimestamp(int(value)).date()
-        except:
+        except Exception:
             return None
     try:
         return dtparse.parse(str(value)).date()
-    except:
+    except Exception:
         return None
 
-
-async def fetch_bookings_for_property(property_id):
-    url = BOOKSTER_API_BASE.rstrip("/") + "/" + BOOKSTER_BOOKINGS_PATH.lstrip("/")
-#    params = {"ei": property_id, "pp": 200, "st": "confirmed"}
-    params = {"ei": property_id, "pp": 200}
+async def fetch_bookings_for_property(property_id: t.Union[int, str]) -> t.List[dict]:
+    """Fetch confirmed bookings for one property (entry)."""
+    url = f"{BOOKSTER_API_BASE.rstrip('/')}/{BOOKSTER_BOOKINGS_PATH.lstrip('/')}"
+    params = {"ei": property_id, "pp": 200, "st": "confirmed"}
     async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
         r = await client.get(url, params=params, auth=("x", BOOKSTER_API_KEY))
         if r.status_code in (301, 302, 303, 307, 308):
-            raise RuntimeError("Authentication redirect - check API key and endpoint.")
+            raise RuntimeError(f"Unexpected redirect {r.status_code} from {url}")
         r.raise_for_status()
         payload = r.json()
+
     if isinstance(payload, dict) and isinstance(payload.get("data"), list):
-        return payload["data"]
-    if isinstance(payload, dict) and isinstance(payload.get("results"), list):
-        return payload["results"]
-    if isinstance(payload, list):
-        return payload
-    return []
+        items = payload["data"]
+    elif isinstance(payload, dict) and isinstance(payload.get("results"), list):
+        items = payload["results"]
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        items = []
+    return items
 
-
-def map_booking(b):
-    state = str(b.get("state", "")).lower()
+def map_booking_to_event_data(b: dict) -> t.Optional[dict]:
+    state = (b.get("state") or "").lower()
     if state in ("cancelled", "canceled", "void", "rejected", "tentative"):
         return None
 
@@ -64,127 +63,136 @@ def map_booking(b):
 
     first = (b.get("customer_forename") or "").strip()
     last = (b.get("customer_surname") or "").strip()
-    name = (first + " " + last).strip() or "Guest"
+    display_name = (first + " " + last).strip() or "Guest"
 
     email = b.get("customer_email") or None
     mobile = b.get("customer_mobile") or b.get("customer_phone") or None
 
+    party_total = None
+    party_val = b.get("party_size")
     try:
-        party_total = int(b.get("party_size"))
-    except:
+        party_total = int(party_val) if party_val not in (None, "") else None
+    except Exception:
         party_total = None
 
-    def f(x):
+    def _to_float(x):
         try:
             return float(x)
-        except:
+        except Exception:
             return None
-    value = f(b.get("value"))
-    balance = f(b.get("balance"))
-    paid = None
-    if value is not None and balance is not None:
-        paid = max(0.0, value - balance)
+    value = _to_float(b.get("value"))
+    balance = _to_float(b.get("balance"))
+    currency = (b.get("currency") or "").upper() or None
+    paid = max(0.0, value - balance) if (value is not None and balance is not None) else None
 
-    extras = []
+    # extras from lines[] of type "extra"
+    extras_list: t.List[str] = []
     lines = b.get("lines")
     if isinstance(lines, list):
         for ln in lines:
             if isinstance(ln, dict) and ln.get("type") == "extra":
-                nm = ln.get("name") or "Extra"
+                name = ln.get("name") or ln.get("title") or "Extra"
                 qty = ln.get("quantity") or ln.get("qty")
-                if qty:
-                    extras.append(nm + " x" + str(qty))
-                else:
-                    extras.append(nm)
+                extras_list.append(f"{name} x{qty}" if qty else name)
 
     return {
         "arrival": arrival,
         "departure": departure,
-        "name": name,
+        "guest_name": display_name,
         "email": email,
         "mobile": mobile,
-        "party": party_total,
-        "extras": extras,
+        "party_total": party_total,
+        "extras": extras_list,
+        "reference": b.get("id") or b.get("reference"),
         "property_name": b.get("entry_name"),
         "property_id": b.get("entry_id"),
         "channel": b.get("syndicate_name"),
-        "currency": (b.get("currency") or "").upper() or None,
+        "currency": currency,
         "paid": paid,
-        "ref": b.get("id") or b.get("reference") or name,
     }
 
-
-def render_calendar(bookings, property_name=None):
+def render_calendar(bookings: t.List[dict], property_name: t.Optional[str] = None) -> bytes:
     cal = Calendar()
     cal.add("prodid", "-//Redroofs Bookster iCal//EN")
     cal.add("version", "2.0")
     if property_name:
-        cal.add("X-WR-CALNAME", property_name + " - Guests")
+        cal.add("X-WR-CALNAME", f"{property_name} – Guests")
 
-    for b in bookings:
-        data = map_booking(b)
-        if not data:
+    for raw in bookings:
+        mapped = map_booking_to_event_data(raw)
+        if not mapped:
             continue
         ev = Event()
-        ev.add("summary", data["name"])
-        ev.add("dtstart", data["arrival"])
-        ev.add("dtend", data["departure"])
-        uid = "redroofs-%s-%s" % (data["ref"], data["arrival"].isoformat())
+        ev.add("summary", mapped["guest_name"])
+        ev.add("dtstart", mapped["arrival"])
+        ev.add("dtend", mapped["departure"])
+        uid = f"redroofs-{(mapped.get('reference') or mapped['guest_name'])}-{mapped['arrival'].isoformat()}"
         ev.add("uid", uid)
-        desc = []
-        if data["email"]:
-            desc.append("Email: " + data["email"])
-        if data["mobile"]:
-            desc.append("Mobile: " + data["mobile"])
-        if data["party"]:
-            desc.append("Guests in party: " + str(data["party"]))
-        if data["extras"]:
-            desc.append("Extras: " + ", ".join(data["extras"]))
-        if data["property_name"]:
-            desc.append("Property: " + data["property_name"])
-        if data["channel"]:
-            desc.append("Channel: " + data["channel"])
-        if data["paid"] is not None:
-            amt = (data["currency"] + " " if data["currency"] else "") + ("%.2f" % data["paid"])
-            desc.append("Amount paid to us: " + amt)
-        ev.add("description", "\n".join(desc) if desc else "Guest booking")
+        lines: t.List[str] = []
+        if mapped.get("email"):
+            lines.append(f"Email: {mapped['email']}")
+        if mapped.get("mobile"):
+            lines.append(f"Mobile: {mapped['mobile']}")
+        if mapped.get("party_total"):
+            lines.append(f"Guests in party: {mapped['party_total']}")
+        if mapped.get("extras"):
+            lines.append("Extras: " + ", ".join(mapped["extras"]))
+        if mapped.get("property_name"):
+            lines.append(f"Property: {mapped['property_name']}")
+        if mapped.get("channel"):
+            lines.append(f"Channel: {mapped['channel']}")
+        if mapped.get("paid") is not None:
+            amt = f"{mapped['paid']:.2f}"
+            if mapped.get("currency"):
+                amt = f"{mapped['currency']} {amt}"
+            lines.append(f"Amount paid to us: {amt}")
+        ev.add("description", "\n".join(lines) if lines else "Guest booking")
         cal.add_component(ev)
     return cal.to_ical()
 
-
-async def generate_and_write(property_ids, outdir="public"):
+async def generate_and_write(property_ids: t.List[str], outdir: str = "public") -> t.List[str]:
+    """Generate .ics files + index.html. On error, write placeholders + error."""
     import traceback
     os.makedirs(outdir, exist_ok=True)
-    written = []
+    written: t.List[str] = []
+    debug_lines: t.List[str] = []
+
     try:
         for pid in property_ids:
             bookings = await fetch_bookings_for_property(pid)
+            debug_lines.append(f"Fetched {len(bookings)} bookings for {pid}")
             prop_name = None
             for b in bookings:
                 if isinstance(b, dict) and b.get("entry_name"):
                     prop_name = b.get("entry_name")
                     break
-            data = render_calendar(bookings, prop_name)
-            p = os.path.join(outdir, pid + ".ics")
-            with open(p, "wb") as f:
-                f.write(data)
-            written.append(p)
+            ics_bytes = render_calendar(bookings, prop_name)
+            path = os.path.join(outdir, f"{pid}.ics")
+            with open(path, "wb") as f:
+                f.write(ics_bytes)
+            written.append(path)
 
-        lines = ["<h1>Redroofs iCal Feeds</h1>", "<p>Feeds regenerate hourly.</p>"]
+        html = ["<h1>Redroofs iCal Feeds</h1>", "<p>Feeds regenerate hourly.</p>"]
         for pid in property_ids:
-            lines.append("<p><a href='%s.ics'>%s.ics</a></p>" % (pid, pid))
+            html.append(f"<p><a href='{pid}.ics'>{pid}.ics</a></p>")
         if DEBUG_DUMP:
-            lines.append("<hr><pre>DEBUG_DUMP on</pre>")
+            html.append("<hr><pre>" + "\n".join(debug_lines) + "</pre>")
         with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+            f.write("\n".join(html))
         return written
 
     except Exception as e:
-        msg = "Error: " + str(e)
-        placeholder = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Redroofs//EN\nEND:VCALENDAR\n"
+        err_text = "Error generating feeds: " + str(e)
+        placeholder = "\n".join([
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//Redroofs//EN",
+            "END:VCALENDAR",
+            "",
+        ])
         for pid in property_ids:
-            with open(os.path.join(outdir, pid + ".ics"), "w", encoding="utf-8") as f:
+            with open(os.path.join(outdir, f"{pid}.ics"), "w", encoding="utf-8") as f:
                 f.write(placeholder)
         with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
-            f.write("<h1>Redroofs iCal Feeds</h1>\n<pre>" + msg + "</pre>")
+            f.write("<h1>Redroofs iCal Feeds</h1>\n<pre>" + err_text + "</pre>")
         return written
