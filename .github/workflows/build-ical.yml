@@ -2,17 +2,18 @@ name: Build iCal feeds hourly
 
 on:
   schedule:
-    - cron: "0 * * * *"   # hourly (UTC)
+    - cron: "0 * * * *"   # hourly, UTC
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -21,76 +22,60 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install httpx icalendar python-dateutil
 
-      - name: API sanity check (temporary)
+      # ---- Sanity check: call Bookster directly ----
+      - name: Sanity check Bookster API (entry 158595)
         env:
           BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
         run: |
           set -e
-          echo "Testing 158595…"
+          echo "Testing GET https://api.booksterhq.com/system/api/v1/booking/bookings.json?ei=158595&pp=1&st=confirmed"
           curl -sS -u "x:${BOOKSTER_API_KEY}" \
-            "https://api.booksterhq.com/system/api/v1/booking/bookings.json?ei=158595&pp=5" \
-            | head -c 2000 || true
-          echo
-          echo "Testing 158596…"
-          curl -sS -u "x:${BOOKSTER_API_KEY}" \
-            "https://api.booksterhq.com/system/api/v1/booking/bookings.json?ei=158596&pp=5" \
-            | head -c 2000 || true
-          echo
-          echo "Testing 158497…"
-          curl -sS -u "x:${BOOKSTER_API_KEY}" \
-            "https://api.booksterhq.com/system/api/v1/booking/bookings.json?ei=158497&pp=5" \
-            | head -c 2000 || true
-
-      - name: Generate .ics files (never fail the build)
-        env:
-          BOOKSTER_API_BASE: ${{ secrets.BOOKSTER_API_BASE }}
-          BOOKSTER_API_KEY:  ${{ secrets.BOOKSTER_API_KEY }}
-        run: |
-          set -u
+            "https://api.booksterhq.com/system/api/v1/booking/bookings.json?ei=158595&pp=1&st=confirmed" \
+            -o check.json
+          # Print top-level keys + first item for visibility
           python - << 'PY'
-          import os, asyncio, pathlib, sys, textwrap
-          # Make sure app.py is present
-          if not pathlib.Path("app.py").exists():
-              print("ERROR: app.py not found at repo root.", file=sys.stderr)
-              # Create placeholders so Pages can still deploy
-              out = pathlib.Path("public"); out.mkdir(exist_ok=True, parents=True)
-              (out/"index.html").write_text("<h1>Redroofs iCal</h1><p>app.py missing</p>")
-              sys.exit(0)
-
-          # Try to generate feeds; fall back to placeholder on error
-          try:
-              from app import generate_and_write
-              out = pathlib.Path("public"); out.mkdir(exist_ok=True, parents=True)
-              pids = ["158595","158596","158497"]
-              asyncio.run(generate_and_write(pids, str(out)))
-              # Friendly index
-              html = ["<h1>Redroofs iCal</h1>"]
-              html += [f"<p><a href='{pid}.ics'>{pid}.ics</a></p>" for pid in pids]
-              (out/"index.html").write_text("\n".join(html), encoding="utf-8")
-          except Exception as e:
-              out = pathlib.Path("public"); out.mkdir(exist_ok=True, parents=True)
-              # Minimal valid ICS so Pages deploys even if Bookster/API fails
-              def minimal_ics(name):
-                  return textwrap.dedent(f"""\
-                  BEGIN:VCALENDAR
-                  VERSION:2.0
-                  PRODID:-//Redroofs//EN
-                  CALSCALE:GREGORIAN
-                  X-WR-CALNAME:{name}
-                  END:VCALENDAR
-                  """)
-              (out/"158595.ics").write_text(minimal_ics("Barn Owl Cabin"), encoding="utf-8")
-              (out/"158596.ics").write_text(minimal_ics("Redroofs by the Woods"), encoding="utf-8")
-              (out/"158497.ics").write_text(minimal_ics("Bumblebee Cabin"), encoding="utf-8")
-              (out/"index.html").write_text(f"<h1>Redroofs iCal</h1><p>Note: placeholder build due to: {e}</p>", encoding="utf-8")
+          import json
+          d=json.load(open("check.json"))
+          if isinstance(d, dict):
+            print("meta:", d.get("meta"))
+            data=d.get("data") or d.get("results")
+            print("data_count:", len(data) if isinstance(data, list) else 0)
+            if isinstance(data, list) and data:
+              print("sample_id:", data[0].get("id"), "state:", data[0].get("state"), "entry_id:", data[0].get("entry_id"))
+          else:
+            print("top_type:", type(d).__name__, "len:", len(d) if hasattr(d, "__len__") else "?")
           PY
 
-      - name: Deploy to GitHub Pages (creates gh-pages)
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./public
-          publish_branch: gh-pages
-          force_orphan: true
+      - name: Generate .ics files
+        env:
+          BOOKSTER_API_BASE:   https://api.booksterhq.com/system/api/v1
+          BOOKSTER_BOOKINGS_PATH: booking/bookings.json
+          BOOKSTER_API_KEY:    ${{ secrets.BOOKSTER_API_KEY }}
+          DEBUG_DUMP:          "1"
+        run: |
+          python - << 'PY'
+          import os, asyncio
+          from pathlib import Path
+          from app import generate_and_write
+          OUT = Path("public"); OUT.mkdir(parents=True, exist_ok=True)
+          props = ["158595","158596","158497"]
+          print("Generating feeds for:", props)
+          asyncio.run(generate_and_write(props, str(OUT)))
+          print("Done.")
+          PY
+
+      - name: Publish to gh-pages
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages || true
+          rm -rf gh-pages
+          git worktree add -B gh-pages gh-pages origin/gh-pages || git worktree add -B gh-pages gh-pages
+          rsync -av --delete public/ gh-pages/
+          cd gh-pages
+          git add .
+          git commit -m "Update iCal feeds" || echo "No changes"
+          git push origin gh-pages
