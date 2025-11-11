@@ -9,13 +9,15 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # allow pushing to gh-pages
+      contents: write   # needed to push to gh-pages
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -29,24 +31,20 @@ jobs:
           BOOKSTER_API_BASE: https://api.booksterhq.com/system/api/v1
           BOOKSTER_BOOKINGS_PATH: booking/bookings.json
           BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
-          # Optional, if your API requires it for your tenant:
-          BOOKSTER_CLIENT_ID: ${{ secrets.BOOKSTER_CLIENT_ID }}
-          # Turn on to write public/debug.json with request attempts meta:
-          DEBUG_DUMP: "1"
+          DEBUG_DUMP: 1
         run: |
           python - << 'PY'
           import os, asyncio, pathlib
           from app import generate_and_write
           OUT = pathlib.Path("public"); OUT.mkdir(parents=True, exist_ok=True)
           pids = ["158595","158596","158497"]
-          paths = asyncio.run(generate_and_write(pids, str(OUT)))
-          print("WROTE:", paths)
+          asyncio.run(generate_and_write(pids, str(OUT)))
           PY
 
-      # Publish the /public folder to gh-pages
+      # Publish the 'public' folder to gh-pages
       - name: Publish to gh-pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: public
-          force_orphan: true
+          publish_branch: gh-pages
