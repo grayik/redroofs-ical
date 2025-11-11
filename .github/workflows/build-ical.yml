@@ -1,30 +1,22 @@
-name: Build & Publish iCal to GitHub Pages (hourly)
+name: Build iCal feeds hourly
 
 on:
   schedule:
-    - cron: "0 * * * *"   # hourly, UTC
+    - cron: "0 * * * *"   # hourly (UTC)
   workflow_dispatch:
-  push:
-    branches: ["main"]
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: "pages"
-  cancel-in-progress: true
+  pages: write       # to deploy to Pages
+  id-token: write    # to authenticate to Pages
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -35,28 +27,25 @@ jobs:
 
       - name: Generate .ics files
         env:
-          # Use the working host you discovered:
-          BOOKSTER_API_BASE: "https://app.booksterhq.com/system/api/v1"
-          BOOKING_DETAIL_PATH_TMPL: "booking/bookings/{id}.json"
-          BOOKINGS_LIST_PATH: "booking/bookings.json"
+          BOOKSTER_API_BASE: https://app.booksterhq.com/system/api/v1
+          BOOKING_DETAIL_PATH: booking/bookings/{id}.json
+          BOOKINGS_LIST_PATH: booking/bookings.json
           BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
           DEBUG_DUMP: "1"
         run: |
           python - << 'PY'
-          import os, asyncio, pathlib
+          import asyncio, pathlib, os
           from app import generate_and_write
           OUT = pathlib.Path("public")
           OUT.mkdir(parents=True, exist_ok=True)
-          # Your three properties:
-          PIDS = ["158595","158596","158497"]
-          asyncio.run(generate_and_write(PIDS, str(OUT)))
-          print("Wrote:", [str(p) for p in OUT.iterdir()])
+          props = ["158595","158596","158497"]
+          asyncio.run(generate_and_write(props, str(OUT)))
           PY
 
-      - name: Upload artifact for Pages
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ./public
+          path: public
 
   deploy:
     needs: build
