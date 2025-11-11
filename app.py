@@ -1,38 +1,30 @@
-# app.py — FastAPI (Option A: live on-demand) with split IN/MID/OUT all-day events
-from __future__ import annotations
+# app.py — static generator: Bookster -> iCal (all-day, IN/OUT split)
+# Used by the GitHub Actions workflow (no web server needed).
 
 import os
 import typing as t
 from datetime import date, datetime, timedelta
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
 from icalendar import Calendar, Event
 from dateutil import parser as dtparse
-from dotenv import load_dotenv
 
-load_dotenv()
-
-# --- Config ------------------------------------------------------------------
+# ======== Configuration ========
+# Use the APP domain (returns data) rather than API domain (403s in your case)
 BOOKSTER_API_BASE = os.getenv("BOOKSTER_API_BASE", "https://app.booksterhq.com/system/api/v1")
 BOOKSTER_BOOKINGS_PATH = os.getenv("BOOKSTER_BOOKINGS_PATH", "booking/bookings.json")
 BOOKSTER_API_KEY = os.getenv("BOOKSTER_API_KEY", "")
+DEBUG_DUMP = os.getenv("DEBUG_DUMP", "0") == "1"
 
-# Your three property IDs -> short codes for title suffix
+# Known property ids -> short codes for titles
 PROPERTY_CODES = {
     "158595": "BO",  # Barn Owl Cabin
     "158596": "RR",  # Redroofs by the Woods
     "158497": "BB",  # Bumblebee Cabin
 }
 
-# Optional small cache (seconds)
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 minutes
-_CACHE: dict[str, dict] = {}
-
-
-# --- Helpers -----------------------------------------------------------------
-def _to_date(value: t.Union[str, int, float, date, datetime, None]) -> date | None:
+# ======== helpers ========
+def _to_date(value: t.Union[str, int, float, date, datetime, None]) -> t.Optional[date]:
     if value is None:
         return None
     if isinstance(value, date) and not isinstance(value, datetime):
@@ -40,7 +32,6 @@ def _to_date(value: t.Union[str, int, float, date, datetime, None]) -> date | No
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, (int, float)):
-        # epoch seconds
         try:
             return datetime.utcfromtimestamp(int(value)).date()
         except Exception:
@@ -51,89 +42,99 @@ def _to_date(value: t.Union[str, int, float, date, datetime, None]) -> date | No
         return None
 
 
-def _cache_get(key: str) -> bytes | None:
-    item = _CACHE.get(key)
-    if not item:
-        return None
-    if (datetime.utcnow().timestamp() - item["ts"]) > CACHE_TTL_SECONDS:
-        return None
-    return item["bytes"]
-
-
-def _cache_set(key: str, data: bytes) -> None:
-    _CACHE[key] = {"bytes": data, "ts": datetime.utcnow().timestamp()}
-
-
-# --- Bookster access ---------------------------------------------------------
-async def fetch_bookings_for_property(property_id: str) -> list[dict]:
+# ======== Bookster access ========
+async def fetch_bookings_for_property(property_id: t.Union[int, str]) -> t.List[dict]:
     """
-    Fetch bookings for an entry (property) using Bookster's system API.
-    Auth: HTTP Basic with username 'x' and password = API key.
-    We prefer using `st=confirmed` but some tenants return 0 for that filter,
-    so we try (1) with st, (2) without st and filter locally.
+    Fetch bookings for one property (entry) using Basic auth:
+      username='x', password=<API key>  (per Bookster docs)
+    We DO NOT trust server-side 'st=confirmed' filter (often zero). We:
+      1) Try with st=confirmed (cheap if it works)
+      2) Fallback to no 'st' (then filter locally by state=='confirmed')
     """
-    base = BOOKSTER_API_BASE.rstrip("/")
-    path = BOOKSTER_BOOKINGS_PATH.lstrip("/")
-    url = f"{base}/{path}"
+    url = f"{BOOKSTER_API_BASE.rstrip('/')}/{BOOKSTER_BOOKINGS_PATH.lstrip('/')}"
+    pid = str(property_id)
 
     async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
-        # Attempt 1: server-side filter by entry & confirmed
-        params1 = {"ei": property_id, "pp": 200, "st": "confirmed"}
+        # Attempt 1: server filter by entry and confirmed
+        params1 = {"ei": pid, "pp": 200, "st": "confirmed"}
         r = await client.get(url, params=params1, auth=("x", BOOKSTER_API_KEY))
         if r.status_code in (301, 302, 303, 307, 308):
-            raise HTTPException(status_code=502, detail="Bookster redirected: check base/path or credentials.")
+            raise RuntimeError(f"Unexpected redirect {r.status_code} from {url}")
         r.raise_for_status()
         payload = r.json()
-        if isinstance(payload, dict) and isinstance(payload.get("meta"), dict) and payload["meta"].get("count"):
-            items = payload.get("data") or payload.get("results") or []
-            return items
+        items = _extract_list(payload)
+        if _count_meta(payload) == 0 or not items:
+            # Attempt 2: server filter by entry only; we’ll filter confirmed locally
+            params2 = {"ei": pid, "pp": 200}
+            r2 = await client.get(url, params=params2, auth=("x", BOOKSTER_API_KEY))
+            r2.raise_for_status()
+            payload2 = r2.json()
+            items2 = _extract_list(payload2)
+            items = [b for b in (items2 or []) if (b.get("state") or "").lower() == "confirmed"]
 
-        # Attempt 2: server-side filter only by entry, local filter by state
-        params2 = {"ei": property_id, "pp": 200}
-        r2 = await client.get(url, params=params2, auth=("x", BOOKSTER_API_KEY))
-        r2.raise_for_status()
-        payload2 = r2.json()
-        if isinstance(payload2, dict):
-            items2 = payload2.get("data") or payload2.get("results") or []
-        elif isinstance(payload2, list):
-            items2 = payload2
-        else:
-            items2 = []
-
-        # Local filter for confirmed
-        items2 = [b for b in items2 if str(b.get("state", "")).lower() == "confirmed"]
-        return items2
+    return items or []
 
 
-def map_booking_to_core(b: dict) -> dict | None:
-    """
-    Normalize booking to the fields we need for calendar generation.
-    """
+def _extract_list(payload: t.Any) -> t.List[dict]:
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        return payload["data"]
+    if isinstance(payload, dict) and isinstance(payload.get("results"), list):
+        return payload["results"]
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def _count_meta(payload: t.Any) -> int:
+    if isinstance(payload, dict) and isinstance(payload.get("meta"), dict):
+        c = payload["meta"].get("count")
+        try:
+            return int(c)
+        except Exception:
+            return 0
+    return 0
+
+
+# ======== mapping ========
+def map_booking_to_event_data(b: dict) -> t.Optional[dict]:
     state = (b.get("state") or "").lower()
-    if state in {"cancelled", "canceled", "void", "rejected", "tentative"}:
+    if state in ("cancelled", "canceled", "void", "rejected", "tentative", "quote", "paymentreq", "paymentnak"):
         return None
 
+    # Dates (Bookster provides epoch seconds for start_inclusive / end_exclusive)
     arrival = _to_date(b.get("start_inclusive"))
-    # Bookster's end_exclusive is the checkout date already; keep as-is
-    checkout = _to_date(b.get("end_exclusive"))
-    if not arrival or not checkout:
+    bookster_end_exclusive = _to_date(b.get("end_exclusive"))
+    if not arrival or not bookster_end_exclusive:
         return None
 
+    # For split-all-days, we need the actual checkout day to appear on the calendar.
+    # Bookster's end_exclusive *is* the checkout date (non-inclusive time), so we include it as an OUT day.
+    checkout_day = bookster_end_exclusive  # keep as-is; we'll render OUT on this day
+
+    # Names
     first = (b.get("customer_forename") or "").strip()
     last = (b.get("customer_surname") or "").strip()
-    guest_name = (f"{first} {last}".strip() or "Guest")
+    display_name = (first + " " + last).strip() or "Guest"
 
+    # Contacts
     email = b.get("customer_email") or None
-    mobile = b.get("customer_tel_mobile") or b.get("customer_mobile") or b.get("customer_tel_day") or None
+    mobile = (
+        b.get("customer_tel_mobile")
+        or b.get("customer_mobile")
+        or b.get("customer_tel_day")
+        or b.get("customer_tel_evening")
+        or b.get("customer_phone")
+        or None
+    )
 
-    # party_size may be string or int
+    # Party size
     party_val = b.get("party_size")
     try:
-        party_total = int(party_val) if party_val not in (None, "") else None
+        party_total = int(party_val) if party_val is not None and str(party_val).strip() != "" else None
     except Exception:
         party_total = None
 
-    # money
+    # Money
     def _to_float(x):
         try:
             return float(x)
@@ -145,10 +146,11 @@ def map_booking_to_core(b: dict) -> dict | None:
     currency = (b.get("currency") or "").upper() or None
     paid = None
     if value is not None and balance is not None:
+        # Paid = total value - remaining balance (matches your earlier checks)
         paid = max(0.0, value - balance)
 
-    # extras — derive from lines[] of type "extra" if present
-    extras_list: list[str] = []
+    # Extras: prefer lines[] entries with type == "extra"
+    extras_list: t.List[str] = []
     lines = b.get("lines")
     if isinstance(lines, list):
         for ln in lines:
@@ -157,44 +159,56 @@ def map_booking_to_core(b: dict) -> dict | None:
                 qty = ln.get("quantity") or ln.get("qty")
                 extras_list.append(f"{name} x{qty}" if qty else name)
 
-    entry_id = str(b.get("entry_id") or "")
-    entry_name = b.get("entry_name")
-    code = PROPERTY_CODES.get(entry_id)
-    if not code and isinstance(entry_name, str):
-        lower = entry_name.lower()
-        if "barn owl" in lower:
-            code = "BO"
-        elif "bumblebee" in lower:
-            code = "BB"
-        elif "redroofs" in lower:
-            code = "RR"
-
     return {
         "arrival": arrival,
-        "checkout": checkout,  # all-day checkout (own day)
-        "guest_name": guest_name,
+        "checkout": checkout_day,
+        "guest_name": display_name,
         "email": email,
         "mobile": mobile,
         "party_total": party_total,
         "extras": extras_list,
         "reference": str(b.get("id") or b.get("reference") or ""),
-        "property_name": entry_name,
-        "property_id": entry_id,
+        "property_name": b.get("entry_name"),
+        "property_id": str(b.get("entry_id") or ""),
         "channel": b.get("syndicate_name"),
         "currency": currency,
         "paid": paid,
-        "code": code or "",
     }
 
 
-# --- Calendar rendering ------------------------------------------------------
-def render_calendar(bookings: list[dict], property_name: str | None = None) -> bytes:
+# ======== iCal rendering (split all-day events with IN/OUT) ========
+def _add_all_day(ev: Event, day: date) -> None:
     """
-    Generate an iCal where each booking is split into:
-      - Arrival day (IN: ... xN (CODE))
-      - Middle days (Guest (CODE)) (one per night between)
-      - Checkout day (OUT: Guest (CODE))
-    All are all-day events. We also embed booking details in description.
+    Add all-day by setting DTSTART=day and DTEND=day+1 (RFC5545 all-day semantics).
+    """
+    ev.add("dtstart", day)                  # VALUE=DATE from date object
+    ev.add("dtend", day + timedelta(days=1))
+
+
+def _title_for_day(mapped: dict, current_day: date) -> str:
+    """
+    Title rules:
+      - First day: "IN: Name xN (CODE)"
+      - Middle days: "Name (CODE)"
+      - Checkout day: "OUT: Name (CODE)"
+      - Always include x1 on the IN day.
+      - CODE is BO/RR/BB based on property id.
+    """
+    name = mapped["guest_name"]
+    pid = mapped.get("property_id") or ""
+    code = PROPERTY_CODES.get(str(pid), "RR")
+    party = mapped.get("party_total") or 1
+
+    if current_day == mapped["arrival"]:
+        return f"IN: {name} x{party} ({code})"
+    if current_day == mapped["checkout"]:
+        return f"OUT: {name} ({code})"
+    return f"{name} ({code})"
+
+
+def render_calendar_split_days(bookings: t.List[dict], property_name: t.Optional[str] = None) -> bytes:
+    """
+    Create all-day events for each calendar day, including an OUT event on checkout day.
     """
     cal = Calendar()
     cal.add("prodid", "-//Redroofs Bookster iCal//EN")
@@ -203,121 +217,104 @@ def render_calendar(bookings: list[dict], property_name: str | None = None) -> b
         cal.add("X-WR-CALNAME", f"{property_name} – Guests")
 
     for raw in bookings:
-        m = map_booking_to_core(raw)
-        if not m:
+        mapped = map_booking_to_event_data(raw)
+        if not mapped:
             continue
 
-        # Unpack
-        guest = m["guest_name"]
-        arrival: date = m["arrival"]
-        checkout: date = m["checkout"]  # this is already the day they leave (own all-day)
-        code = m["code"]
-        party = m["party_total"]
+        # Day loop: from arrival up to and including checkout day
+        day = mapped["arrival"]
+        while day <= mapped["checkout"]:
+            ev = Event()
+            ev.add("summary", _title_for_day(mapped, day))
+            _add_all_day(ev, day)
 
-        # Build common description lines
-        desc_lines: list[str] = []
-        if m.get("email"):
-            desc_lines.append(f"Email: {m['email']}")
-        if m.get("mobile"):
-            desc_lines.append(f"Mobile: {m['mobile']}")
-        if m.get("party_total"):
-            desc_lines.append(f"Guests in party: {m['party_total']}")
-        if m.get("extras"):
-            desc_lines.append("Extras: " + ", ".join(m["extras"]))
-        if m.get("property_name"):
-            desc_lines.append(f"Property: {m['property_name']}")
-        if m.get("channel"):
-            desc_lines.append(f"Channel: {m['channel']}")
-        if m.get("paid") is not None:
-            amt = f"{m['paid']:.2f}"
-            if m.get("currency"):
-                amt = f"{m['currency']} {amt}"
-            desc_lines.append(f"Amount paid to us: {amt}")
-        # Link to booking in Bookster (if we have an ID)
-        if m.get("reference"):
-            link = f"https://app.booksterhq.com/bookings/{m['reference']}/view"
-            desc_lines.append(f"Booking: {link}")
+            # UID per-day so updates replace correctly in client calendars
+            uid = f"redroofs-{mapped.get('reference')}-{day.isoformat()}"
+            ev.add("uid", uid)
 
-        # 1) Arrival day event (IN: ...)
-        title_in = f"IN: {guest}"
-        if party:
-            title_in += f" x{party}"
-        if code:
-            title_in += f" ({code})"
-        ev_in = Event()
-        ev_in.add("summary", title_in)
-        ev_in.add("dtstart", arrival)
-        ev_in.add("dtend", arrival + timedelta(days=1))  # all-day, non-inclusive next day
-        ev_in.add("uid", f"redroofs-in-{m['reference']}-{arrival.isoformat()}")
-        ev_in.add("description", "\n".join(desc_lines) if desc_lines else "Guest booking")
-        cal.add_component(ev_in)
+            # Description details (once per event; same info each day)
+            lines: t.List[str] = []
+            if mapped.get("email"):
+                lines.append(f"Email: {mapped['email']}")
+            if mapped.get("mobile"):
+                lines.append(f"Mobile: {mapped['mobile']}")
+            if mapped.get("party_total"):
+                lines.append(f"Guests in party: {mapped['party_total']}")
+            if mapped.get("extras"):
+                lines.append("Extras: " + ", ".join(mapped["extras"]))
+            if mapped.get("property_name"):
+                lines.append(f"Property: {mapped['property_name']}")
+            if mapped.get("channel"):
+                lines.append(f"Channel: {mapped['channel']}")
+            if mapped.get("paid") is not None:
+                amt = f"{mapped['paid']:.2f}"
+                if mapped.get("currency"):
+                    amt = f"{mapped['currency']} {amt}"
+                lines.append(f"Amount paid to us: {amt}")
 
-        # 2) Middle days (Guest (CODE)) — from arrival+1 up to (checkout-1)
-        current = arrival + timedelta(days=1)
-        last_night = checkout - timedelta(days=1)
-        while current <= last_night - timedelta(days=0):
-            # Only create if there actually is a middle night
-            if current < checkout and current > arrival:
-                title_mid = f"{guest}"
-                if code:
-                    title_mid += f" ({code})"
-                ev_mid = Event()
-                ev_mid.add("summary", title_mid)
-                ev_mid.add("dtstart", current)
-                ev_mid.add("dtend", current + timedelta(days=1))
-                ev_mid.add("uid", f"redroofs-mid-{m['reference']}-{current.isoformat()}")
-                ev_mid.add("description", "\n".join(desc_lines) if desc_lines else "Guest booking")
-                cal.add_component(ev_mid)
-            current += timedelta(days=1)
+            # Booking link
+            if mapped.get("reference"):
+                bid = mapped["reference"]
+                lines.append(f"Booking: https://app.booksterhq.com/bookings/{bid}/view")
 
-        # 3) Checkout day (OUT: ...)
-        title_out = f"OUT: {guest}"
-        if code:
-            title_out += f" ({code})"
-        ev_out = Event()
-        ev_out.add("summary", title_out)
-        ev_out.add("dtstart", checkout)
-        ev_out.add("dtend", checkout + timedelta(days=1))
-        ev_out.add("uid", f"redroofs-out-{m['reference']}-{checkout.isoformat()}")
-        ev_out.add("description", "\n".join(desc_lines) if desc_lines else "Guest booking")
-        cal.add_component(ev_out)
+            ev.add("description", "\n".join(lines) if lines else "Guest booking")
+            cal.add_component(ev)
+
+            day += timedelta(days=1)
 
     return cal.to_ical()
 
 
-# --- FastAPI app -------------------------------------------------------------
-app = FastAPI(title="Redroofs Bookster → iCal (Option A live)")
-
-@app.get("/healthz")
-async def health() -> dict:
-    return {"status": "ok"}
-
-@app.get("/calendar/{property_id}.ics")
-async def calendar(property_id: str, property_name: str | None = None):
+# ======== GitHub Action entry ========
+async def generate_and_write(property_ids: t.List[str], outdir: str = "public") -> t.List[str]:
     """
-    iCal feed for a single property.
-    Subscribe this URL in Google/Apple/Outlook. We cache results briefly.
+    Generate one .ics per property and a simple index.html.
+    On error, create placeholder feeds and surface the error in index.html.
     """
-    cache_key = f"prop:{property_id}:{property_name or ''}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return Response(content=cached, media_type="text/calendar", headers={"Cache-Control": "public, max-age=300"})
+    import traceback
 
-    bookings = await fetch_bookings_for_property(property_id)
-    # If not provided, try to derive a name from first booking
-    if not property_name:
-        for b in bookings:
-            if isinstance(b, dict) and b.get("entry_name"):
-                property_name = b["entry_name"]
-                break
-    ics_bytes = render_calendar(bookings, property_name)
-    _cache_set(cache_key, ics_bytes)
+    os.makedirs(outdir, exist_ok=True)
+    written: t.List[str] = []
+    debug_lines: t.List[str] = []
 
-    return Response(
-        content=ics_bytes,
-        media_type="text/calendar",
-        headers={
-            "Content-Type": "text/calendar; charset=utf-8",
-            "Cache-Control": "public, max-age=300",
-        },
-    )
+    try:
+        for pid in property_ids:
+            bookings = await fetch_bookings_for_property(pid)
+            prop_name = None
+            for b in bookings:
+                if isinstance(b, dict) and b.get("entry_name"):
+                    prop_name = b.get("entry_name")
+                    break
+
+            ics_bytes = render_calendar_split_days(bookings, prop_name)
+            path = os.path.join(outdir, f"{pid}.ics")
+            with open(path, "wb") as f:
+                f.write(ics_bytes)
+            written.append(path)
+
+            if DEBUG_DUMP:
+                debug_lines.append(f"PID {pid}: events={len(bookings)}")
+
+        # Build index.html
+        html = ["<h1>Redroofs iCal Feeds</h1>", "<p>Feeds regenerate hourly.</p>"]
+        for pid in property_ids:
+            html.append(f"<p><a href='{pid}.ics'>{pid}.ics</a></p>")
+        if DEBUG_DUMP and debug_lines:
+            html.append("<hr><pre>" + "\n".join(debug_lines) + "</pre>")
+
+        with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
+            f.write("\n".join(html))
+
+        return written
+
+    except Exception as e:
+        # Placeholders + error message
+        placeholder = "\n".join(
+            ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Redroofs Bookster iCal//EN", "END:VCALENDAR", ""]
+        )
+        for pid in property_ids:
+            with open(os.path.join(outdir, f"{pid}.ics"), "w", encoding="utf-8") as f:
+                f.write(placeholder)
+        with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
+            f.write("<h1>Redroofs iCal Feeds</h1>\n<pre>Error: " + str(e) + "</pre>")
+        return written
