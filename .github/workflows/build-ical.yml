@@ -1,8 +1,8 @@
-name: Build and deploy iCal feeds to GitHub Pages
+name: Build iCal feeds hourly
 
 on:
   schedule:
-    - cron: "0 * * * *"   # hourly (UTC)
+    - cron: "0 * * * *"   # hourly, UTC
   workflow_dispatch:
 
 permissions:
@@ -31,29 +31,34 @@ jobs:
 
       - name: Generate .ics files
         env:
-          # IMPORTANT: use the host that returns data for you
           BOOKSTER_API_BASE: https://app.booksterhq.com/system/api/v1
+          BOOKSTER_BOOKINGS_PATH: booking/bookings.json
           BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
-          DEBUG_DUMP: "1"
+          DEBUG_DUMP: 1
         run: |
           python - << 'PY'
           import os, asyncio, pathlib
           from app import generate_and_write
-          OUT = pathlib.Path("public"); OUT.mkdir(parents=True, exist_ok=True)
-          pids = ["158595","158596","158497"]
-          asyncio.run(generate_and_write(pids, str(OUT)))
+
+          OUT = pathlib.Path("public")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          PIDS = ["158595","158596","158497"]
+          asyncio.run(generate_and_write(PIDS, str(OUT)))
           PY
 
-      - name: Upload Pages artifact
+      - name: Upload artifact for Pages
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
 
   deploy:
-    needs: build
-    runs-on: ubuntu-latest
     environment:
       name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
     steps:
       - name: Deploy to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v4
