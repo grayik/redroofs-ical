@@ -43,7 +43,8 @@ EXTRA_ALLOWLIST = (
     "high chair", "infant cot", "cot", "twin beds", "twin bed", "twins"
 )
 
-AGE_KEYWORDS = {"adult", "child", "infant", "baby"}  # for OTA name quirks (Airbnb etc.)
+# Airbnb/OTA terms that show up as names but are actually age categories
+AGE_WORD_NAMES = {"adult", "child", "infant", "baby"}
 
 # ---------- helpers ----------
 
@@ -116,7 +117,7 @@ def _prop_code(entry_id: t.Any, entry_name: str | None) -> str:
 def _expand_stay_days(arrival: date, departure: date) -> list[date]:
     """
     Return the calendar days covered by the stay PLUS an explicit 0UT day.
-    Bookster's end_exclusive is the checkout day; we add an 0UT event on that day.
+    Bookster's end_exclusive is the checkout day; we add a 0UT event on that day.
     """
     days: list[date] = []
     cur = arrival
@@ -159,7 +160,7 @@ async def fetch_list_for_property(property_id: str) -> list[dict]:
 
 async def fetch_detail(booking_id: t.Union[str, int]) -> dict:
     """
-    Get full details for a single booking (reliable value/balance/lines/phones).
+    Get full details for a single booking (reliable value/balance/lines/phones/party).
     """
     path = BOOKSTER_DETAIL_PATH_TMPL.format(id=booking_id)
     async with httpx.AsyncClient() as client:
@@ -167,100 +168,6 @@ async def fetch_detail(booking_id: t.Union[str, int]) -> dict:
         if isinstance(payload, dict):
             return payload
         return {}
-
-# ---------- party details formatting ----------
-
-def _norm(s: str) -> str:
-    return " ".join((s or "").split()).strip()
-
-def _split_name(forename: str, surname: str) -> tuple[str, str]:
-    return _norm(forename), _norm(surname)
-
-def _infer_age_from_name_tokens(tokens: list[str]) -> tuple[str | None, list[str]]:
-    """
-    If tokens include solely an age word (Adult/Child/Infant/Baby), treat that as age.
-    If tokens contain one of those plus other tokens, treat the age token as age and
-    the remaining tokens as the person's name.
-    Returns (age_label|None, remaining_name_tokens).
-    """
-    lower = [tkn.lower() for tkn in tokens if tkn]
-    if not lower:
-        return None, []
-    # Find any age word present
-    age_candidates = [tkn for tkn in lower if tkn in AGE_KEYWORDS]
-    if not age_candidates:
-        return None, tokens  # no age keyword in name; keep all tokens as name
-    age = age_candidates[0].capitalize()  # "Adult" / "Child" / "Infant" / "Baby"
-    # Remove all age keywords from the original tokens (case-insensitive)
-    remaining = [tok for tok in tokens if tok.lower() not in AGE_KEYWORDS]
-    return age, remaining
-
-def _format_party_list(detail_payload: dict) -> list[str]:
-    """
-    Build the "Party details" section.
-    Rules:
-      - Always include lead guest as Guest 1 using top-level customer_* fields.
-      - Then include each member of `party` from the detail payload.
-      - If a party member's "name" is e.g. 'Adult'/'Child'/'Infant'/'Baby', treat that as age, not name.
-      - If there's only the lead guest with info (no other members with info), return [] (omit section).
-      - No emails in this section.
-    """
-    lines: list[str] = []
-
-    # Build Guest 1 (lead) from customer fields
-    lead_first = _norm(detail_payload.get("customer_forename") or "")
-    lead_last = _norm(detail_payload.get("customer_surname") or "")
-    lead_name = " ".join(x for x in [lead_first, lead_last] if x).strip() or "Guest"
-    guests: list[tuple[str | None, str | None]] = []  # list of tuples (name, age)
-
-    # Lead age is not provided reliably; don't infer it from 'type'
-    guests.append((lead_name, None))
-
-    # Add party members from detail payload
-    party = detail_payload.get("party")
-    if isinstance(party, list):
-        for member in party:
-            if not isinstance(member, dict):
-                continue
-            fn, sn = _split_name(member.get("forename") or "", member.get("surname") or "")
-            tokens = [tok for tok in [fn, sn] if tok]
-            age, name_tokens = _infer_age_from_name_tokens(tokens)
-            name_str = " ".join(name_tokens).strip()
-            # If no tokens at all, skip this member (no information)
-            if not (name_str or age):
-                continue
-            guests.append((name_str if name_str else None, age))
-
-    # Decide whether to show the section:
-    # If only Guest 1 exists and has no further info (i.e., length == 1), omit.
-    if len(guests) <= 1:
-        return []
-
-    # De-duplicate an exact duplicate of lead if party[0] repeated it
-    deduped: list[tuple[str | None, str | None]] = []
-    seen = set()
-    for name, age in guests:
-        key = (name or "", age or "")
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append((name, age))
-
-    # If after dedup we still only have the lead, omit
-    if len(deduped) <= 1:
-        return []
-
-    # Emit as "Guest N: <Name> – <Age>" or "Guest N: <Age>" if name is missing
-    for idx, (name, age) in enumerate(deduped, start=1):
-        if name and age:
-            lines.append(f"Guest {idx}: {name} – {age}")
-        elif name:
-            lines.append(f"Guest {idx}: {name}")
-        else:
-            # Name missing, but age present (e.g., "Adult"/"Child")
-            lines.append(f"Guest {idx}: {age}")
-
-    return lines
 
 # ---------- mapping ----------
 
@@ -282,6 +189,84 @@ def _filter_extras(lines: t.Any) -> list[str]:
                 qty = ln.get("quantity") or ln.get("qty")
                 picked.append(f"{name} x{qty}" if qty else name)
     return picked
+
+def _full_name(forename: str | None, surname: str | None) -> str:
+    f = (forename or "").strip()
+    s = (surname or "").strip()
+    return (f"{f} {s}".strip()) if (f or s) else ""
+
+def _build_party_details_list(b: dict) -> list[str]:
+    """
+    Build ordered display list: Guest 1 is always the lead guest (customer_*).
+    Then append party[] members, skipping a duplicate of the lead if present.
+    - If a party member's forename is 'Adult'/'Child'/'Infant'/'Baby', treat that as age category (not name).
+    - Include age if age > 0, in parentheses e.g. '(age 7)'.
+    - Do not include emails here.
+    """
+    result: list[str] = []
+
+    # Lead guest from customer_* fields
+    lead_name = _full_name(b.get("customer_forename"), b.get("customer_surname"))
+    if lead_name:
+        result.append(lead_name)
+    else:
+        result.append("Guest")  # fallback
+
+    # Build the rest from party[]
+    party = b.get("party")
+    if not isinstance(party, list):
+        party = []
+
+    # If the first party member equals lead (common), skip that duplicate
+    def _normalize_name(n: str) -> str:
+        return " ".join(n.split()).strip().lower()
+
+    lead_norm = _normalize_name(lead_name)
+
+    for idx, m in enumerate(party):
+        if not isinstance(m, dict):
+            continue
+        forename = (m.get("forename") or "").strip()
+        surname = (m.get("surname") or "").strip()
+        age_val = m.get("age")
+
+        # Determine if this forename is actually an age category label
+        label = None
+        if forename.lower() in AGE_WORD_NAMES:
+            label = forename.title()  # Adult / Child / Infant / Baby
+            name_str = _full_name("", surname)  # surname-only if present
+        else:
+            name_str = _full_name(forename, surname)
+
+        # Skip exact duplicate of the lead when there's no extra info
+        if name_str and lead_norm and _normalize_name(name_str) == lead_norm:
+            # If completely same as lead, don't add again
+            continue
+
+        parts: list[str] = []
+        if name_str:
+            parts.append(name_str)
+        if label and (not name_str or label.lower() not in name_str.lower()):
+            # Add label only if we don't already effectively include it as the name
+            parts.append(label)
+
+        # Age if > 0
+        try:
+            age_int = int(age_val) if age_val is not None and str(age_val).strip() != "" else 0
+        except Exception:
+            age_int = 0
+        if age_int > 0:
+            parts.append(f"(age {age_int})")
+
+        display = " ".join(parts).strip()
+        if display:
+            result.append(display)
+
+    # If only the lead guest ended up with info, suppress the whole section
+    if len(result) <= 1:
+        return []
+
+    return result
 
 def map_booking_to_event_data(b: dict) -> dict | None:
     state = (b.get("state") or "").lower()
@@ -312,8 +297,8 @@ def map_booking_to_event_data(b: dict) -> dict | None:
     channel = b.get("syndicate_name")
     currency = (b.get("currency") or "").upper() or None
 
-    # Build "Party details" section lines (using the enriched 'b' detail payload)
-    party_lines = _format_party_list(b)
+    # Build party details list (may be [])
+    party_details_list = _build_party_details_list(b)
 
     return {
         "id": b.get("id"),
@@ -323,7 +308,6 @@ def map_booking_to_event_data(b: dict) -> dict | None:
         "email": email,
         "phone": phone,
         "party": party,
-        "party_lines": party_lines,
         "extras": extras,
         "value": value,
         "balance": balance,
@@ -332,6 +316,7 @@ def map_booking_to_event_data(b: dict) -> dict | None:
         "entry_id": entry_id,
         "entry_name": entry_name,
         "channel": channel,
+        "party_details_list": party_details_list,
     }
 
 # ---------- iCal rendering ----------
@@ -346,7 +331,7 @@ def _title_for_day(kind: str, guest: str, party: int | None, code: str) -> str:
         suffix = f" x{party}" if party is not None else ""
         return f"IN: {guest}{suffix} ({code})"
     if kind == "OUT":
-        return f"0UT: {guest} ({code})"  # '0' to sort before IN across clients
+        return f"0UT: {guest} ({code})"  # '0UT' to sort before 'IN' in some clients
     return f"{guest} ({code})"  # MID
 
 def _booking_url(booking_id: t.Union[str, int, None]) -> str | None:
@@ -390,10 +375,6 @@ def render_calendar(bookings: list[dict], calendar_name: str | None = None) -> b
                 desc.append(f"Mobile: {mapped['phone']}")
             if mapped["party"] is not None:
                 desc.append(f"Guests in party: {mapped['party']}")
-            if mapped["party_lines"]:
-                desc.append("Party details")
-                for line in mapped["party_lines"]:
-                    desc.append(line)
             if mapped["extras"]:
                 desc.append("Extras: " + ", ".join(mapped["extras"]))
             if mapped["entry_name"]:
@@ -405,6 +386,14 @@ def render_calendar(bookings: list[dict], calendar_name: str | None = None) -> b
                 if mapped["currency"]:
                     amt = f"{mapped['currency']} {amt}"
                 desc.append(f"Amount paid to us: {amt}")
+
+            # Party details section
+            pdl = mapped.get("party_details_list") or []
+            if pdl:
+                desc.append("Party details")
+                for idx, line in enumerate(pdl, start=1):
+                    desc.append(f"Guest {idx}: {line}")
+
             link = _booking_url(mapped["id"])
             if link:
                 desc.append(f"Booking: {link}")
@@ -421,7 +410,7 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
     Generate one .ics per property. Steps:
       1) List bookings by ei (entry_id), no server-side state filter.
       2) Client-filter to confirmed.
-      3) Enrich each booking via detail endpoint (reliable value/balance/lines/phones/party array).
+      3) Enrich each booking via detail endpoint (reliable value/balance/lines/phones/party).
       4) Render to calendar, write <pid>.ics and an index.html.
     """
     import traceback
