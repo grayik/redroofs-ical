@@ -2,7 +2,7 @@
 # ----------------------------------------------------------
 # The GitHub Action imports `generate_and_write()` from this file.
 # It fetches bookings (list), enriches each one from the detail endpoint,
-# and writes one .ics per property with all-day events split into IN/MID/OUT.
+# and writes one .ics per property with all-day events split into IN/MID/0UT.
 
 from __future__ import annotations
 
@@ -113,16 +113,88 @@ def _prop_code(entry_id: t.Any, entry_name: str | None) -> str:
 
 def _expand_stay_days(arrival: date, departure: date) -> list[date]:
     """
-    Return the calendar days covered by the stay PLUS an explicit OUT day.
-    Bookster's end_exclusive is the checkout day; we add an OUT event on that day.
+    Return the calendar days covered by the stay PLUS an explicit 0UT day.
+    Bookster's end_exclusive is the checkout day; we add a 0UT event on that day.
     """
     days: list[date] = []
     cur = arrival
     while cur < departure:
         days.append(cur)
         cur += timedelta(days=1)
-    days.append(departure)  # explicit OUT day
+    days.append(departure)  # explicit 0UT day
     return days
+
+def _normalize_party_type(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    r = raw.strip().lower()
+    if not r:
+        return None
+    if r in ("adult", "standard"):
+        return "Adult"
+    if r in ("child", "kid", "junior"):
+        return "Child"
+    if r in ("infant", "baby", "toddler"):
+        return "Infant"
+    # fallback to capitalized original
+    return raw.strip().capitalize()
+
+def _person_name(title: str | None, forename: str | None, surname: str | None) -> str:
+    bits = [s.strip() for s in [title or "", forename or "", surname or ""] if s and s.strip()]
+    return " ".join(bits).strip()
+
+def _party_details(b: dict, lead_fullname: str) -> list[str]:
+    """
+    Build the "Party details" list:
+      - Include the lead guest in the list.
+      - Include additional party members from b["party"] (if present).
+      - If the lead is the ONLY one with any information, return [] (omit section).
+      - Format lines as plain strings; numbering (Guest 1, 2, ...) happens in render.
+    """
+    details: list[str] = []
+
+    # Pull the party array if present
+    party = b.get("party")
+    party_lines: list[str] = []
+    if isinstance(party, list):
+        for member in party:
+            if not isinstance(member, dict):
+                continue
+            name = _person_name(member.get("title"), member.get("forename"), member.get("surname"))
+            ptype = _normalize_party_type(member.get("type"))
+            if name and ptype:
+                line = f"{name} – {ptype}"
+            elif name:
+                line = name
+            elif ptype:
+                line = ptype
+            else:
+                # If absolutely nothing provided, skip this row
+                continue
+            party_lines.append(line)
+
+    # Determine if the lead is already represented in the party list (by name, case-insensitive)
+    def _eq(a: str, b: str) -> bool:
+        return a.strip().lower() == b.strip().lower()
+
+    lead_in_party = any(_eq(lead_fullname, pl.split(" – ")[0]) for pl in party_lines if pl)
+
+    # Compose details list with lead first
+    if lead_fullname:
+        details.append(lead_fullname)
+    if party_lines:
+        # If lead already appears in party list, avoid duplication by excluding exact match
+        if lead_in_party:
+            filtered_party = [pl for pl in party_lines if not _eq(lead_fullname, pl.split(" – ")[0])]
+            details.extend(filtered_party)
+        else:
+            details.extend(party_lines)
+
+    # If after all this we only have the lead and no one else with info, omit the section
+    if len(details) <= 1:
+        return []
+
+    return details
 
 # ---------- API calls ----------
 
@@ -157,7 +229,7 @@ async def fetch_list_for_property(property_id: str) -> list[dict]:
 
 async def fetch_detail(booking_id: t.Union[str, int]) -> dict:
     """
-    Get full details for a single booking (reliable value/balance/lines/phones).
+    Get full details for a single booking (reliable value/balance/lines/phones/party).
     """
     path = BOOKSTER_DETAIL_PATH_TMPL.format(id=booking_id)
     async with httpx.AsyncClient() as client:
@@ -199,7 +271,7 @@ def map_booking_to_event_data(b: dict) -> dict | None:
 
     first = (b.get("customer_forename") or "").strip()
     last = (b.get("customer_surname") or "").strip()
-    guest = (f"{first} {last}".strip()) or "Guest"
+    lead_fullname = (f"{first} {last}".strip()) or "Guest"
 
     email = (b.get("customer_email") or "").strip() or None
     phone = _best_phone(b)
@@ -216,9 +288,12 @@ def map_booking_to_event_data(b: dict) -> dict | None:
     channel = b.get("syndicate_name")
     currency = (b.get("currency") or "").upper() or None
 
+    # New: party details list (lead + others), possibly omitted if lead-only
+    party_details = _party_details(b, lead_fullname)
+
     return {
         "id": b.get("id"),
-        "guest": guest,
+        "guest": lead_fullname,
         "arrival": arrival,
         "departure": departure,  # end_exclusive (checkout)
         "email": email,
@@ -232,6 +307,7 @@ def map_booking_to_event_data(b: dict) -> dict | None:
         "entry_id": entry_id,
         "entry_name": entry_name,
         "channel": channel,
+        "party_details": party_details,   # <-- added
     }
 
 # ---------- iCal rendering ----------
@@ -241,6 +317,7 @@ def _title_for_day(kind: str, guest: str, party: int | None, code: str) -> str:
     kind: "IN", "MID", "OUT"
     Only show xN on IN (and include x1).
     Always append property code in parentheses.
+    (We use '0UT' instead of 'OUT' to sort before 'IN' in some clients.)
     """
     if kind == "IN":
         suffix = f" x{party}" if party is not None else ""
@@ -278,7 +355,7 @@ def render_calendar(bookings: list[dict], calendar_name: str | None = None) -> b
         code = _prop_code(mapped["entry_id"], mapped["entry_name"])
         days = _expand_stay_days(mapped["arrival"], mapped["departure"])
 
-        # days[0] is IN, days[-1] is OUT, any between are MID
+        # days[0] is IN, days[-1] is 0UT, any between are MID
         for i, day in enumerate(days):
             kind = "IN" if i == 0 else ("OUT" if i == len(days) - 1 else "MID")
             title = _title_for_day(kind, mapped["guest"], mapped["party"], code)
@@ -301,6 +378,13 @@ def render_calendar(bookings: list[dict], calendar_name: str | None = None) -> b
                 if mapped["currency"]:
                     amt = f"{mapped['currency']} {amt}"
                 desc.append(f"Amount paid to us: {amt}")
+
+            # New: Party details section (if present)
+            if mapped.get("party_details"):
+                desc.append("Party details")
+                for idx, line in enumerate(mapped["party_details"], start=1):
+                    desc.append(f"Guest {idx}: {line}")
+
             link = _booking_url(mapped["id"])
             if link:
                 desc.append(f"Booking: {link}")
@@ -317,7 +401,7 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
     Generate one .ics per property. Steps:
       1) List bookings by ei (entry_id), no server-side state filter.
       2) Client-filter to confirmed.
-      3) Enrich each booking via detail endpoint (reliable value/balance/lines/phones).
+      3) Enrich each booking via detail endpoint (reliable value/balance/lines/phones/party).
       4) Render to calendar, write <pid>.ics and an index.html.
     """
     import traceback
