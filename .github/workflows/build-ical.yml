@@ -5,20 +5,15 @@ on:
     - cron: "0 * * * *"   # hourly, UTC
   workflow_dispatch:
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to push to gh-pages
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -29,10 +24,12 @@ jobs:
 
       - name: Generate .ics files
         env:
+          # IMPORTANT: use the working base URL that returns data for you:
           BOOKSTER_API_BASE: https://app.booksterhq.com/system/api/v1
-          BOOKSTER_BOOKINGS_PATH: booking/bookings.json
+          BOOKING_DETAILS_PATH_TMPL: booking/bookings/{id}.json
+          BOOKINGS_LIST_PATH: booking/bookings.json
           BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
-          DEBUG_DUMP: 1
+          DEBUG_DUMP: "1"
         run: |
           python - << 'PY'
           import os, asyncio, pathlib
@@ -42,18 +39,8 @@ jobs:
           asyncio.run(generate_and_write(pids, str(OUT)))
           PY
 
-      - name: Upload artifact for Pages
-        uses: actions/upload-pages-artifact@v3
+      - name: Publish to gh-pages
+        uses: peaceiris/actions-gh-pages@v3
         with:
-          path: public
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: public
