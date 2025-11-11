@@ -2,18 +2,24 @@ name: Build iCal feeds hourly
 
 on:
   schedule:
-    - cron: "0 * * * *"   # hourly, UTC
-  workflow_dispatch:
+    - cron: "0 * * * *"   # run hourly (UTC)
+  workflow_dispatch:      # allow manual runs
+
+permissions:
+  contents: write         # needed to push to gh-pages
+  pages: write            # needed by pages actions
+  id-token: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   # needed to push to gh-pages
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -24,23 +30,34 @@ jobs:
 
       - name: Generate .ics files
         env:
-          # IMPORTANT: use the working base URL that returns data for you:
+          # Use the endpoint that returns data for your account
           BOOKSTER_API_BASE: https://app.booksterhq.com/system/api/v1
-          BOOKING_DETAILS_PATH_TMPL: booking/bookings/{id}.json
-          BOOKINGS_LIST_PATH: booking/bookings.json
+          BOOKSTER_BOOKINGS_PATH: booking/bookings.json
           BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
-          DEBUG_DUMP: "1"
+          DEBUG_DUMP: "1"            # shows debug on index.html (optional)
         run: |
           python - << 'PY'
           import os, asyncio, pathlib
           from app import generate_and_write
-          OUT = pathlib.Path("public"); OUT.mkdir(parents=True, exist_ok=True)
+
+          # Ensure output dir exists
+          OUT = pathlib.Path("public")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          # Your three properties
           pids = ["158595","158596","158497"]
+
+          # Run generator (writes one .ics per PID + index.html)
           asyncio.run(generate_and_write(pids, str(OUT)))
+
+          print("Generated:", [str(p) for p in OUT.glob("*.ics")])
           PY
 
-      - name: Publish to gh-pages
-        uses: peaceiris/actions-gh-pages@v3
+      # Publish the static 'public' directory to the gh-pages branch
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: public
+          path: public
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
