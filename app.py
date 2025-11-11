@@ -219,6 +219,12 @@ def render_calendar(bookings: list[dict], property_name: str | None = None) -> b
             if mapped.get("currency"):
                 amt = f"{mapped['currency']} {amt}"
             lines.append(f"Amount paid to us: {amt}")
+
+        # NEW — add clickable booking link
+        booking_id = mapped.get("reference")
+        if booking_id:
+            link = f"https://app.booksterhq.com/bookings/{booking_id}/view"
+            lines.append(f"Booking: {link}")
         ev.add("description", "\n".join(lines) if lines else "Guest booking")
         cal.add_component(ev)
     return cal.to_ical()
