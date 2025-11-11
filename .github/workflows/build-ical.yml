@@ -2,22 +2,19 @@ name: Build iCal feeds hourly
 
 on:
   schedule:
-    - cron: "0 * * * *"   # hourly, UTC
+    - cron: "0 * * * *"   # hourly (UTC)
   workflow_dispatch:
+
+permissions:
+  contents: write  # needed for gh-pages pushes
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   # needed to push to gh-pages
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -28,10 +25,11 @@ jobs:
 
       - name: Generate .ics files
         env:
-          BOOKSTER_API_BASE: https://api.booksterhq.com/system/api/v1
+          # Use the host that works for you; you discovered app.booksterhq.com is correct
+          BOOKSTER_API_BASE: https://app.booksterhq.com/system/api/v1
           BOOKSTER_BOOKINGS_PATH: booking/bookings.json
           BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
-          DEBUG_DUMP: 1
+          DEBUG_DUMP: "1"
         run: |
           python - << 'PY'
           import os, asyncio, pathlib
@@ -41,10 +39,9 @@ jobs:
           asyncio.run(generate_and_write(pids, str(OUT)))
           PY
 
-      # Publish the 'public' folder to gh-pages
       - name: Publish to gh-pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: public
-          publish_branch: gh-pages
+          publish_dir: ./public
+          enable_jekyll: false
