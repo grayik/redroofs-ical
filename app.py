@@ -43,6 +43,8 @@ EXTRA_ALLOWLIST = (
     "high chair", "infant cot", "cot", "twin beds", "twin bed", "twins"
 )
 
+AGE_KEYWORDS = {"adult", "child", "infant", "baby"}  # for OTA name quirks (Airbnb etc.)
+
 # ---------- helpers ----------
 
 def _to_date(v: t.Union[str, int, float, date, datetime, None]) -> date | None:
@@ -114,7 +116,7 @@ def _prop_code(entry_id: t.Any, entry_name: str | None) -> str:
 def _expand_stay_days(arrival: date, departure: date) -> list[date]:
     """
     Return the calendar days covered by the stay PLUS an explicit 0UT day.
-    Bookster's end_exclusive is the checkout day; we add a 0UT event on that day.
+    Bookster's end_exclusive is the checkout day; we add an 0UT event on that day.
     """
     days: list[date] = []
     cur = arrival
@@ -123,78 +125,6 @@ def _expand_stay_days(arrival: date, departure: date) -> list[date]:
         cur += timedelta(days=1)
     days.append(departure)  # explicit 0UT day
     return days
-
-def _normalize_party_type(raw: str | None) -> str | None:
-    if not raw:
-        return None
-    r = raw.strip().lower()
-    if not r:
-        return None
-    if r in ("adult", "standard"):
-        return "Adult"
-    if r in ("child", "kid", "junior"):
-        return "Child"
-    if r in ("infant", "baby", "toddler"):
-        return "Infant"
-    # fallback to capitalized original
-    return raw.strip().capitalize()
-
-def _person_name(title: str | None, forename: str | None, surname: str | None) -> str:
-    bits = [s.strip() for s in [title or "", forename or "", surname or ""] if s and s.strip()]
-    return " ".join(bits).strip()
-
-def _party_details(b: dict, lead_fullname: str) -> list[str]:
-    """
-    Build the "Party details" list:
-      - Include the lead guest in the list.
-      - Include additional party members from b["party"] (if present).
-      - If the lead is the ONLY one with any information, return [] (omit section).
-      - Format lines as plain strings; numbering (Guest 1, 2, ...) happens in render.
-    """
-    details: list[str] = []
-
-    # Pull the party array if present
-    party = b.get("party")
-    party_lines: list[str] = []
-    if isinstance(party, list):
-        for member in party:
-            if not isinstance(member, dict):
-                continue
-            name = _person_name(member.get("title"), member.get("forename"), member.get("surname"))
-            ptype = _normalize_party_type(member.get("type"))
-            if name and ptype:
-                line = f"{name} – {ptype}"
-            elif name:
-                line = name
-            elif ptype:
-                line = ptype
-            else:
-                # If absolutely nothing provided, skip this row
-                continue
-            party_lines.append(line)
-
-    # Determine if the lead is already represented in the party list (by name, case-insensitive)
-    def _eq(a: str, b: str) -> bool:
-        return a.strip().lower() == b.strip().lower()
-
-    lead_in_party = any(_eq(lead_fullname, pl.split(" – ")[0]) for pl in party_lines if pl)
-
-    # Compose details list with lead first
-    if lead_fullname:
-        details.append(lead_fullname)
-    if party_lines:
-        # If lead already appears in party list, avoid duplication by excluding exact match
-        if lead_in_party:
-            filtered_party = [pl for pl in party_lines if not _eq(lead_fullname, pl.split(" – ")[0])]
-            details.extend(filtered_party)
-        else:
-            details.extend(party_lines)
-
-    # If after all this we only have the lead and no one else with info, omit the section
-    if len(details) <= 1:
-        return []
-
-    return details
 
 # ---------- API calls ----------
 
@@ -229,7 +159,7 @@ async def fetch_list_for_property(property_id: str) -> list[dict]:
 
 async def fetch_detail(booking_id: t.Union[str, int]) -> dict:
     """
-    Get full details for a single booking (reliable value/balance/lines/phones/party).
+    Get full details for a single booking (reliable value/balance/lines/phones).
     """
     path = BOOKSTER_DETAIL_PATH_TMPL.format(id=booking_id)
     async with httpx.AsyncClient() as client:
@@ -237,6 +167,100 @@ async def fetch_detail(booking_id: t.Union[str, int]) -> dict:
         if isinstance(payload, dict):
             return payload
         return {}
+
+# ---------- party details formatting ----------
+
+def _norm(s: str) -> str:
+    return " ".join((s or "").split()).strip()
+
+def _split_name(forename: str, surname: str) -> tuple[str, str]:
+    return _norm(forename), _norm(surname)
+
+def _infer_age_from_name_tokens(tokens: list[str]) -> tuple[str | None, list[str]]:
+    """
+    If tokens include solely an age word (Adult/Child/Infant/Baby), treat that as age.
+    If tokens contain one of those plus other tokens, treat the age token as age and
+    the remaining tokens as the person's name.
+    Returns (age_label|None, remaining_name_tokens).
+    """
+    lower = [tkn.lower() for tkn in tokens if tkn]
+    if not lower:
+        return None, []
+    # Find any age word present
+    age_candidates = [tkn for tkn in lower if tkn in AGE_KEYWORDS]
+    if not age_candidates:
+        return None, tokens  # no age keyword in name; keep all tokens as name
+    age = age_candidates[0].capitalize()  # "Adult" / "Child" / "Infant" / "Baby"
+    # Remove all age keywords from the original tokens (case-insensitive)
+    remaining = [tok for tok in tokens if tok.lower() not in AGE_KEYWORDS]
+    return age, remaining
+
+def _format_party_list(detail_payload: dict) -> list[str]:
+    """
+    Build the "Party details" section.
+    Rules:
+      - Always include lead guest as Guest 1 using top-level customer_* fields.
+      - Then include each member of `party` from the detail payload.
+      - If a party member's "name" is e.g. 'Adult'/'Child'/'Infant'/'Baby', treat that as age, not name.
+      - If there's only the lead guest with info (no other members with info), return [] (omit section).
+      - No emails in this section.
+    """
+    lines: list[str] = []
+
+    # Build Guest 1 (lead) from customer fields
+    lead_first = _norm(detail_payload.get("customer_forename") or "")
+    lead_last = _norm(detail_payload.get("customer_surname") or "")
+    lead_name = " ".join(x for x in [lead_first, lead_last] if x).strip() or "Guest"
+    guests: list[tuple[str | None, str | None]] = []  # list of tuples (name, age)
+
+    # Lead age is not provided reliably; don't infer it from 'type'
+    guests.append((lead_name, None))
+
+    # Add party members from detail payload
+    party = detail_payload.get("party")
+    if isinstance(party, list):
+        for member in party:
+            if not isinstance(member, dict):
+                continue
+            fn, sn = _split_name(member.get("forename") or "", member.get("surname") or "")
+            tokens = [tok for tok in [fn, sn] if tok]
+            age, name_tokens = _infer_age_from_name_tokens(tokens)
+            name_str = " ".join(name_tokens).strip()
+            # If no tokens at all, skip this member (no information)
+            if not (name_str or age):
+                continue
+            guests.append((name_str if name_str else None, age))
+
+    # Decide whether to show the section:
+    # If only Guest 1 exists and has no further info (i.e., length == 1), omit.
+    if len(guests) <= 1:
+        return []
+
+    # De-duplicate an exact duplicate of lead if party[0] repeated it
+    deduped: list[tuple[str | None, str | None]] = []
+    seen = set()
+    for name, age in guests:
+        key = (name or "", age or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((name, age))
+
+    # If after dedup we still only have the lead, omit
+    if len(deduped) <= 1:
+        return []
+
+    # Emit as "Guest N: <Name> – <Age>" or "Guest N: <Age>" if name is missing
+    for idx, (name, age) in enumerate(deduped, start=1):
+        if name and age:
+            lines.append(f"Guest {idx}: {name} – {age}")
+        elif name:
+            lines.append(f"Guest {idx}: {name}")
+        else:
+            # Name missing, but age present (e.g., "Adult"/"Child")
+            lines.append(f"Guest {idx}: {age}")
+
+    return lines
 
 # ---------- mapping ----------
 
@@ -271,7 +295,7 @@ def map_booking_to_event_data(b: dict) -> dict | None:
 
     first = (b.get("customer_forename") or "").strip()
     last = (b.get("customer_surname") or "").strip()
-    lead_fullname = (f"{first} {last}".strip()) or "Guest"
+    guest = (f"{first} {last}".strip()) or "Guest"
 
     email = (b.get("customer_email") or "").strip() or None
     phone = _best_phone(b)
@@ -288,17 +312,18 @@ def map_booking_to_event_data(b: dict) -> dict | None:
     channel = b.get("syndicate_name")
     currency = (b.get("currency") or "").upper() or None
 
-    # New: party details list (lead + others), possibly omitted if lead-only
-    party_details = _party_details(b, lead_fullname)
+    # Build "Party details" section lines (using the enriched 'b' detail payload)
+    party_lines = _format_party_list(b)
 
     return {
         "id": b.get("id"),
-        "guest": lead_fullname,
+        "guest": guest,
         "arrival": arrival,
         "departure": departure,  # end_exclusive (checkout)
         "email": email,
         "phone": phone,
         "party": party,
+        "party_lines": party_lines,
         "extras": extras,
         "value": value,
         "balance": balance,
@@ -307,7 +332,6 @@ def map_booking_to_event_data(b: dict) -> dict | None:
         "entry_id": entry_id,
         "entry_name": entry_name,
         "channel": channel,
-        "party_details": party_details,   # <-- added
     }
 
 # ---------- iCal rendering ----------
@@ -317,13 +341,12 @@ def _title_for_day(kind: str, guest: str, party: int | None, code: str) -> str:
     kind: "IN", "MID", "OUT"
     Only show xN on IN (and include x1).
     Always append property code in parentheses.
-    (We use '0UT' instead of 'OUT' to sort before 'IN' in some clients.)
     """
     if kind == "IN":
         suffix = f" x{party}" if party is not None else ""
         return f"IN: {guest}{suffix} ({code})"
     if kind == "OUT":
-        return f"0UT: {guest} ({code})"
+        return f"0UT: {guest} ({code})"  # '0' to sort before IN across clients
     return f"{guest} ({code})"  # MID
 
 def _booking_url(booking_id: t.Union[str, int, None]) -> str | None:
@@ -367,6 +390,10 @@ def render_calendar(bookings: list[dict], calendar_name: str | None = None) -> b
                 desc.append(f"Mobile: {mapped['phone']}")
             if mapped["party"] is not None:
                 desc.append(f"Guests in party: {mapped['party']}")
+            if mapped["party_lines"]:
+                desc.append("Party details")
+                for line in mapped["party_lines"]:
+                    desc.append(line)
             if mapped["extras"]:
                 desc.append("Extras: " + ", ".join(mapped["extras"]))
             if mapped["entry_name"]:
@@ -378,13 +405,6 @@ def render_calendar(bookings: list[dict], calendar_name: str | None = None) -> b
                 if mapped["currency"]:
                     amt = f"{mapped['currency']} {amt}"
                 desc.append(f"Amount paid to us: {amt}")
-
-            # New: Party details section (if present)
-            if mapped.get("party_details"):
-                desc.append("Party details")
-                for idx, line in enumerate(mapped["party_details"], start=1):
-                    desc.append(f"Guest {idx}: {line}")
-
             link = _booking_url(mapped["id"])
             if link:
                 desc.append(f"Booking: {link}")
@@ -401,7 +421,7 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
     Generate one .ics per property. Steps:
       1) List bookings by ei (entry_id), no server-side state filter.
       2) Client-filter to confirmed.
-      3) Enrich each booking via detail endpoint (reliable value/balance/lines/phones/party).
+      3) Enrich each booking via detail endpoint (reliable value/balance/lines/phones/party array).
       4) Render to calendar, write <pid>.ics and an index.html.
     """
     import traceback
