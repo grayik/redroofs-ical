@@ -254,13 +254,14 @@ def _booking_url(booking_id: t.Union[str, int, None]) -> str | None:
 def _add_event(cal: Calendar, when: date, title: str, desc_lines: list[str], uid: str) -> None:
     ev = Event()
     ev.add("summary", title)
-        # After ev.add("summary", title)
-        if "OUT:" in title:
-            ev.add("priority", 1)   # highest
-        elif "IN:" in title:
-            ev.add("priority", 9)   # low
-        else:
-            ev.add("priority", 5)   # middle nights
+# After ev.add("summary", title)
+if "OUT:" in title:
+    ev.add("priority", 1)   # highest
+elif "IN:" in title:
+    ev.add("priority", 9)   # low
+else:
+    ev.add("priority", 5)   # middle nights
+
     ev.add("dtstart", when)  # VALUE=DATE (all-day)
     ev.add("dtend", when + timedelta(days=1))  # next day (non-inclusive end)
     ev.add("uid", uid)
