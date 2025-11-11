@@ -1,24 +1,29 @@
-name: Build iCal feeds hourly
+name: Build & Publish iCal to GitHub Pages (hourly)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # run hourly (UTC)
-  workflow_dispatch:      # allow manual runs
+    - cron: "0 * * * *"   # hourly, UTC
+  workflow_dispatch:
+  push:
+    branches: ["main"]
 
 permissions:
-  contents: write         # needed to push to gh-pages
-  pages: write            # needed by pages actions
+  contents: read
+  pages: write
   id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -30,34 +35,34 @@ jobs:
 
       - name: Generate .ics files
         env:
-          # Use the endpoint that returns data for your account
-          BOOKSTER_API_BASE: https://app.booksterhq.com/system/api/v1
-          BOOKSTER_BOOKINGS_PATH: booking/bookings.json
+          # Use the working host you discovered:
+          BOOKSTER_API_BASE: "https://app.booksterhq.com/system/api/v1"
+          BOOKING_DETAIL_PATH_TMPL: "booking/bookings/{id}.json"
+          BOOKINGS_LIST_PATH: "booking/bookings.json"
           BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
-          DEBUG_DUMP: "1"            # shows debug on index.html (optional)
+          DEBUG_DUMP: "1"
         run: |
           python - << 'PY'
           import os, asyncio, pathlib
           from app import generate_and_write
-
-          # Ensure output dir exists
           OUT = pathlib.Path("public")
           OUT.mkdir(parents=True, exist_ok=True)
-
-          # Your three properties
-          pids = ["158595","158596","158497"]
-
-          # Run generator (writes one .ics per PID + index.html)
-          asyncio.run(generate_and_write(pids, str(OUT)))
-
-          print("Generated:", [str(p) for p in OUT.glob("*.ics")])
+          # Your three properties:
+          PIDS = ["158595","158596","158497"]
+          asyncio.run(generate_and_write(PIDS, str(OUT)))
+          print("Wrote:", [str(p) for p in OUT.iterdir()])
           PY
 
-      # Publish the static 'public' directory to the gh-pages branch
-      - name: Upload artifact
+      - name: Upload artifact for Pages
         uses: actions/upload-pages-artifact@v3
         with:
-          path: public
+          path: ./public
 
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    steps:
       - name: Deploy to GitHub Pages
         uses: actions/deploy-pages@v4
