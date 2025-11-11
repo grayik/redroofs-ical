@@ -237,13 +237,16 @@ def map_booking_to_event_data(b: dict) -> dict | None:
 # ---------- iCal rendering ----------
 
 def _title_for_day(kind: str, guest: str, party: int | None, code: str) -> str:
-    NBSP = "\u00A0"  # non-breaking space; sorts before letters and is visually just a space
+    """
+    kind: "IN", "MID", "OUT"
+    Only show xN on IN (and include x1).
+    Always append property code in parentheses.
+    """
     if kind == "IN":
         suffix = f" x{party}" if party is not None else ""
         return f"IN: {guest}{suffix} ({code})"
     if kind == "OUT":
-        # NBSP before OUT nudges it to the top when apps sort by SUMMARY
-        return f"{NBSP}OUT: {guest} ({code})"
+        return f"•OUT: {guest} ({code})"
     return f"{guest} ({code})"  # MID
 
 def _booking_url(booking_id: t.Union[str, int, None]) -> str | None:
@@ -254,14 +257,6 @@ def _booking_url(booking_id: t.Union[str, int, None]) -> str | None:
 def _add_event(cal: Calendar, when: date, title: str, desc_lines: list[str], uid: str) -> None:
     ev = Event()
     ev.add("summary", title)
-    # After ev.add("summary", title)
-    if "OUT:" in title:
-        ev.add("priority", 1)   # highest
-    elif "IN:" in title:
-        ev.add("priority", 9)   # low
-    else:
-        ev.add("priority", 5)   # middle nights
-
     ev.add("dtstart", when)  # VALUE=DATE (all-day)
     ev.add("dtend", when + timedelta(days=1))  # next day (non-inclusive end)
     ev.add("uid", uid)
