@@ -4,20 +4,18 @@
 # It fetches bookings (list), enriches each one from the detail endpoint,
 # and writes one .ics per property with all-day events split into IN/MID/OUT.
 #
-# Key behaviours you asked for:
+# Behaviours:
 # - All-day events only
-# - Split first/last days with titles:
+# - Titles:
 #     IN: <Guest> xN (CODE)   [x1 included]
-#     <Guest> (CODE)          [middle nights, no xN]
+#     <Guest> (CODE)          [middle days, no xN]
 #     OUT: <Guest> (CODE)
-# - Property codes: RR (Redroofs by the Woods / 158596),
-#                   BO (Barn Owl Cabin / 158595),
-#                   BB (Bumblebee Cabin / 158497)
-# - Event details include: email, *mobile/phone* (from multiple fields),
-#   party size, extras, property, channel, amount paid (value - balance),
-#   and a Booking link to the Bookster console
-# - Enrichment: for each booking in the list, we fetch /booking/bookings/{id}.json
-#   so we get reliable `value`, `balance`, `lines` (extras), and phone fields.
+# - Property codes: RR (158596), BO (158595), BB (158497)
+# - Details include: email, mobile/phone, party size, filtered extras
+#   (Pets, High Chair, Infant Cot, Twin Beds), property, channel, amount paid,
+#   and a Booking link to the Bookster console.
+# - Enrichment: for each list item, fetch /booking/bookings/{id}.json for reliable
+#   value, balance, lines (extras), and phone fields.
 
 from __future__ import annotations
 
@@ -30,8 +28,7 @@ from icalendar import Calendar, Event
 from dateutil import parser as dtparse
 
 # ---------- configuration ----------
-# Note: you reported the "api.booksterhq.com" host returned 403 for you,
-# while "app.booksterhq.com" returned data. So we default to "app".
+# You observed api.booksterhq.com returned 403 for you, while app.booksterhq.com worked.
 BOOKSTER_API_BASE = os.getenv(
     "BOOKSTER_API_BASE",
     "https://app.booksterhq.com/system/api/v1",
@@ -105,7 +102,6 @@ def _amount_paid(value: t.Any, balance: t.Any) -> float | None:
         v = float(value)
         bal = float(balance)
         paid = v - bal
-        # Avoid negative tiny floats caused by representation issues
         if abs(paid) < 1e-9:
             paid = 0.0
         return max(0.0, paid)
@@ -130,18 +126,14 @@ def _expand_stay_days(arrival: date, departure: date) -> list[date]:
     Return a list of calendar days covered by the stay:
     - IN is on `arrival`
     - MID days are the dates strictly between arrival and (departure - 1)
-    - OUT is on `departure`
-    NOTE: Your requirement is to show the checkout as the *day after* Bookster's last day.
-          Bookster gives end_exclusive; the guest checks out on that day.
-          We'll put OUT on `departure` (which is end_exclusive).
+    - OUT is on `departure` (Bookster end_exclusive)
     """
     days: list[date] = []
     cur = arrival
-    # include arrival..(departure) inclusive by representing OUT separately
     while cur < departure:
         days.append(cur)
         cur += timedelta(days=1)
-    # Add explicit OUT day as departure (so it’s a separate VEVENT)
+    # explicit OUT day (end_exclusive)
     days.append(departure)
     return days
 
@@ -158,32 +150,23 @@ async def _bookster_get(client: httpx.AsyncClient, path: str, params: dict | Non
 
 async def fetch_list_for_property(property_id: str) -> list[dict]:
     """
-    Fetch a booking list. Using 'ei' (entry id) filter *without* 'st=confirmed' first,
-    because you observed counts drop to 0 when 'st=confirmed' is supplied by the server.
+    Fetch a booking list. Using 'ei' (entry id) filter WITHOUT 'st=confirmed' first,
+    because you observed counts drop to 0 with server-side state filter.
     We'll client-filter to state == 'confirmed' afterwards.
     """
     async with httpx.AsyncClient() as client:
-        # Try with ei only
         payload = await _bookster_get(client, BOOKSTER_LIST_PATH, {"ei": property_id, "pp": 200})
-        # Normalise to list
         if isinstance(payload, dict) and isinstance(payload.get("data"), list):
             items = payload["data"]
-            meta = payload.get("meta", {})
         elif isinstance(payload, list):
             items = payload
-            meta = {"count": len(items)}
         else:
             items = []
-            meta = {"count": 0}
-        # Client-side filter to confirmed only
         items = [b for b in items if (b.get("state") or "").lower() == "confirmed"]
-        # Debug output goes into index page later if DEBUG_DUMP
         return items
 
 async def fetch_detail(booking_id: t.Union[str, int]) -> dict:
-    """
-    Get full details for a single booking (for reliable value/balance/lines and phone fields).
-    """
+    """Get full details for a single booking (value/balance/lines/phones)."""
     path = BOOKSTER_DETAIL_PATH_TMPL.format(id=booking_id)
     async with httpx.AsyncClient() as client:
         payload = await _bookster_get(client, path)
@@ -193,9 +176,44 @@ async def fetch_detail(booking_id: t.Union[str, int]) -> dict:
 
 # ---------- mapping ----------
 
+# Allowed extras (case-insensitive, with a few common aliases)
+_ALLOWED_EXTRA_KEYWORDS = (
+    "pet", "pets", "dog", "dogs",          # Pets
+    "high chair", "highchair",             # High Chair
+    "infant cot", "cot (infant)", "cot",   # Infant Cot
+    "twin beds", "twin bed",               # Twin Beds
+)
+
+def _filter_extras(lines: t.Any) -> list[str]:
+    """
+    Keep only specific extras from lines[]:
+      - Pets (pet/dog variants)
+      - High Chair
+      - Infant Cot
+      - Twin Beds
+    Return them as display strings, including ' xN' if a positive quantity is present.
+    """
+    out: list[str] = []
+    if not isinstance(lines, list):
+        return out
+    for ln in lines:
+        if not isinstance(ln, dict) or (ln.get("type") != "extra"):
+            continue
+        name = (ln.get("name") or ln.get("title") or "").strip()
+        if not name:
+            continue
+        lname = name.lower()
+        if any(k in lname for k in _ALLOWED_EXTRA_KEYWORDS):
+            qty = ln.get("quantity") or ln.get("qty")
+            try:
+                q = int(qty) if qty is not None and str(qty).strip() != "" else None
+            except Exception:
+                q = None
+            out.append(f"{name} x{q}" if q and q > 0 else name)
+    return out
+
 def map_booking_to_event_data(b: dict) -> dict | None:
-    state = (b.get("state") or "").lower()
-    if state not in ("confirmed",):
+    if (b.get("state") or "").lower() != "confirmed":
         return None
 
     arrival = _to_date(b.get("start_inclusive"))
@@ -209,18 +227,10 @@ def map_booking_to_event_data(b: dict) -> dict | None:
 
     email = (b.get("customer_email") or "").strip() or None
     phone = _best_phone(b)
-
     party = _party_size(b)
 
-    # Extras from lines[] of type "extra"
-    extras: list[str] = []
-    lines = b.get("lines")
-    if isinstance(lines, list):
-        for ln in lines:
-            if isinstance(ln, dict) and ln.get("type") == "extra":
-                name = (ln.get("name") or ln.get("title") or "Extra").strip()
-                qty = ln.get("quantity") or ln.get("qty")
-                extras.append(f"{name} x{qty}" if qty else name)
+    # Filtered extras from detail lines
+    extras = _filter_extras(b.get("lines"))
 
     value = b.get("value")
     balance = b.get("balance")
@@ -264,7 +274,9 @@ def _title_for_day(kind: str, guest: str, party: int | None, code: str) -> str:
         return f"OUT: {guest} ({code})"
     return f"{guest} ({code})"  # MID
 
-def _booking_url(booking_id: t.Union[str, int, None]) -> str | None:
+def _booking_url(booking_id: t.Uni
+
+on[str, int, None]) -> str | None:
     if not booking_id:
         return None
     return f"https://app.booksterhq.com/bookings/{booking_id}/view"
@@ -292,7 +304,6 @@ def render_calendar(bookings: list[dict], calendar_name: str | None = None) -> b
 
         code = _prop_code(mapped["entry_id"], mapped["entry_name"])
         days = _expand_stay_days(mapped["arrival"], mapped["departure"])
-        # days[0] is arrival (IN), days[-1] is OUT, middle are MID (if any)
         for i, day in enumerate(days):
             kind = "IN" if i == 0 else ("OUT" if i == len(days) - 1 else "MID")
             title = _title_for_day(kind, mapped["guest"], mapped["party"], code)
@@ -341,27 +352,21 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
 
     try:
         for pid in property_ids:
-            # 1) base list
             base = await fetch_list_for_property(pid)
             debug_lines.append(f"PID {pid}: base_list={len(base)}")
 
-            # 2) enrich each booking
             enriched: list[dict] = []
             for item in base:
                 bid = item.get("id")
                 if not bid:
                     continue
                 detail = await fetch_detail(bid)
-                # Merge: detail overrides list item
                 merged = {**item, **detail}
                 enriched.append(merged)
             debug_lines.append(f"PID {pid}: enriched={len(enriched)}")
 
-            # Sort by arrival just to keep calendars tidy
             enriched.sort(key=lambda x: (_to_date(x.get("start_inclusive")) or date.min))
 
-            # 3) render
-            # Try to infer a name from first booking (fallback to the ID)
             cal_name = None
             for b in enriched:
                 if b.get("entry_name"):
@@ -375,7 +380,6 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
                 f.write(ics_bytes)
             written.append(path)
 
-        # 4) index
         html = [
             "<h1>Redroofs iCal Feeds</h1>",
             "<p>Feeds regenerate hourly.</p>",
@@ -392,7 +396,6 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
         return written
 
     except Exception as e:
-        # Failsafe: write placeholder feeds + the error to the index
         placeholder = "\n".join(
             ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Redroofs Bookster iCal//EN", "END:VCALENDAR", ""]
         )
@@ -400,5 +403,6 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
             with open(os.path.join(outdir, f"{pid}.ics"), "w", encoding="utf-8") as f:
                 f.write(placeholder)
         with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
-            f.write(f"<h1>Redroofs iCal Feeds</h1>\n<pre>{e}\n{traceback.format_exc()}</pre>")
+            import traceback as _tb
+            f.write(f"<h1>Redroofs iCal Feeds</h1>\n<pre>{e}\n{_tb.format_exc()}</pre>")
         return written
