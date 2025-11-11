@@ -246,7 +246,7 @@ def _title_for_day(kind: str, guest: str, party: int | None, code: str) -> str:
         suffix = f" x{party}" if party is not None else ""
         return f"IN: {guest}{suffix} ({code})"
     if kind == "OUT":
-        return f"•OUT: {guest} ({code})"
+        return f"0UT: {guest} ({code})"
     return f"{guest} ({code})"  # MID
 
 def _booking_url(booking_id: t.Union[str, int, None]) -> str | None:
