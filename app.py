@@ -244,7 +244,7 @@ def _title_for_day(kind: str, guest: str, party: int | None, code: str) -> str:
     """
     if kind == "IN":
         suffix = f" x{party}" if party is not None else ""
-        return f"1N: {guest}{suffix} ({code})"
+        return f"IN: {guest}{suffix} ({code})"
     if kind == "OUT":
         return f"0UT: {guest} ({code})"
     return f"{guest} ({code})"  # MID
