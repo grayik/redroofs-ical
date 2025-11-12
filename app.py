@@ -2,12 +2,9 @@
 # ----------------------------------------------------------
 # The GitHub Action imports `generate_and_write()` from this file.
 # It fetches bookings (list), enriches each one from the detail endpoint,
-# and writes one .ics per property with all-day events split into IN/MID/0UT.
-#
-# Output filenames (by property ID):
-#   158595 -> BO-API.ics   (Barn Owl Cabin)
-#   158596 -> RR-API.ics   (Redroofs by the Woods)
-#   158497 -> BB-API.ics   (Bumblebee Cabin)
+# and writes two sets of .ics per property:
+#   1) Full: IN, MID, 0UT  -> BO-API.ics, RR-API.ics, BB-API.ics
+#   2) IN/OUT only         -> BO-API-INOUT.ics, RR-API-INOUT.ics, BB-API-INOUT.ics
 
 from __future__ import annotations
 
@@ -40,12 +37,10 @@ PROPERTY_CODES: dict[str, str] = {
     "158595": "BO",  # Barn Owl Cabin
     "158497": "BB",  # Bumblebee Cabin
 }
-
-# Output filenames for each property
-OUTPUT_FILENAMES: dict[str, str] = {
-    "158595": "BO-API.ics",
-    "158596": "RR-API.ics",
-    "158497": "BB-API.ics",
+PID_TO_FILENAMES: dict[str, tuple[str, str]] = {
+    "158595": ("BO-API.ics", "BO-API-INOUT.ics"),
+    "158596": ("RR-API.ics", "RR-API-INOUT.ics"),
+    "158497": ("BB-API.ics", "BB-API-INOUT.ics"),
 }
 
 # Extras we care about (case-insensitive matching on the "name" field)
@@ -54,8 +49,7 @@ EXTRA_ALLOWLIST = (
     "high chair", "infant cot", "cot", "twin beds", "twin bed", "twins",
 )
 
-# OTA age keywords that sometimes appear in name fields
-AGE_KEYWORDS = ("adult", "child", "infant", "baby")
+AIRBNB_LABELS = {"adult", "child", "infant", "baby"}  # labels that often appear as "names"
 
 # ---------- helpers ----------
 
@@ -127,15 +121,15 @@ def _prop_code(entry_id: t.Any, entry_name: str | None) -> str:
 
 def _expand_stay_days(arrival: date, departure: date) -> list[date]:
     """
-    Return the calendar days covered by the stay PLUS an explicit OUT day.
-    Bookster's end_exclusive is the checkout day; we add an OUT event on that day.
+    Return the calendar days covered by the stay PLUS an explicit 0UT day.
+    Bookster's end_exclusive is the checkout day; we add a 0UT event on that day.
     """
     days: list[date] = []
     cur = arrival
     while cur < departure:
         days.append(cur)
         cur += timedelta(days=1)
-    days.append(departure)  # explicit OUT day
+    days.append(departure)  # explicit 0UT day
     return days
 
 # ---------- API calls ----------
@@ -180,7 +174,7 @@ async def fetch_detail(booking_id: t.Union[str, int]) -> dict:
             return payload
         return {}
 
-# ---------- extras filtering ----------
+# ---------- party parsing ----------
 
 def _filter_extras(lines: t.Any) -> list[str]:
     """
@@ -201,101 +195,105 @@ def _filter_extras(lines: t.Any) -> list[str]:
                 picked.append(f"{name} x{qty}" if qty else name)
     return picked
 
-# ---------- party details ----------
-
-def _party_descriptions(b: dict) -> list[str]:
+def _parse_party_list(party: t.Any, lead_full_name: str) -> list[str]:
     """
-    Build 'Guest N: ...' lines based on b['party'].
-    - Include lead guest (from customer_forename/surname) in the list,
-      unless they are the only person and there's no extra info — then omit the section.
-    - Treat 'Adult', 'Child', 'Infant', 'Baby' appearing in name fields as an age category,
-      not a personal name.
-    - Include ages if provided and not 0 (formatted as 'age X').
-    - Never include emails here.
+    Build lines like:
+      Guest 1: Alice Smith
+      Guest 2: Adult (age 34)
+      Guest 3: Child
+    Rules:
+      - If a "name" is literally Adult/Child/Infant/Baby, treat that as the category (not a name).
+      - Use 'type' only if it is one of those age categories; ignore 'standard'.
+      - Include age iff age > 0.
+      - We always include the lead guest in the list EXCEPT when they are the only guest with any info.
     """
-    lead_first = (b.get("customer_forename") or "").strip()
-    lead_last = (b.get("customer_surname") or "").strip()
-    lead_full = " ".join(p for p in [lead_first, lead_last] if p).strip()
+    def norm(s: str) -> str:
+        return (s or "").strip()
 
-    party = b.get("party")
-    if not isinstance(party, list):
-        # If we don't have structured party info, only include the section if there is more than just the lead name.
-        return []
+    def join_name(fn: str, ln: str) -> str:
+        fn, ln = norm(fn), norm(ln)
+        full = (fn + " " + ln).strip()
+        return full
 
-    def parse_member(m: dict) -> tuple[str, str, int | None]:
-        # returns (name, category, age)
-        title = (m.get("title") or "").strip()
-        first = (m.get("forename") or "").strip()
-        last = (m.get("surname") or "").strip()
-        age_val = m.get("age")
-        try:
-            age_num = int(age_val) if age_val not in (None, "", "0") else None
-        except Exception:
-            age_num = None
+    # Prepare raw entries as tuples (name, category, age)
+    raw: list[tuple[str, str | None, int | None]] = []
 
-        # Detect age category keywords in any name fields
-        cat = ""
-        joined_lower = " ".join([title, first, last]).lower()
-        for kw in AGE_KEYWORDS:
-            if kw in joined_lower:
-                cat = kw.capitalize()
-                break
+    if isinstance(party, list) and party:
+        for person in party:
+            if not isinstance(person, dict):
+                continue
+            fn = norm(person.get("forename", ""))
+            ln = norm(person.get("surname", ""))
+            tcat = norm(person.get("type", "")).lower()
+            age = person.get("age", 0)
+            try:
+                age = int(age)
+            except Exception:
+                age = 0
 
-        # Build display name, but omit any 'Adult/Child/Infant/Baby' tokens used by OTAs
-        def scrub(s: str) -> str:
-            s_low = s.lower().strip()
-            return "" if any(kw == s_low for kw in AGE_KEYWORDS) else s.strip()
+            # If the "name" itself is one of the labels, treat as category instead
+            fn_l = fn.lower()
+            ln_l = ln.lower()
+            name_is_label = fn_l in AIRBNB_LABELS or ln_l in AIRBNB_LABELS
 
-        first_scrub = scrub(first)
-        last_scrub = scrub(last)
-        title_scrub = scrub(title)
+            category: str | None = None
+            if tcat in AIRBNB_LABELS:
+                category = tcat.capitalize()
 
-        display_name = " ".join(p for p in [title_scrub, first_scrub, last_scrub] if p).strip()
+            if name_is_label:
+                # Determine category from whichever part is a label
+                if fn_l in AIRBNB_LABELS:
+                    category = fn.capitalize()
+                    fn = ""  # remove from name
+                if ln_l in AIRBNB_LABELS:
+                    category = (ln.capitalize() if not category else category)
+                    ln = ""  # remove from name
 
-        return (display_name, cat, age_num)
+            full_name = join_name(fn, ln)
+            if not full_name and category:
+                display = category  # e.g., "Adult"
+            elif full_name and category:
+                # Name exists + category known; spec doesn't require showing both,
+                # but keeping just the name is tidier.
+                display = full_name
+            else:
+                display = full_name or ""  # may still be empty
 
-    members: list[tuple[str, str, int | None]] = []
-    for m in party:
-        if isinstance(m, dict):
-            members.append(parse_member(m))
+            raw.append((display, category, age if age and age > 0 else None))
 
-    # If party list is empty and no lead name => nothing to show
-    if not members and not lead_full:
-        return []
+    # If party list is empty/invalid, try to construct list with at least the lead
+    if not raw:
+        raw = [(lead_full_name, None, None)]
 
-    # Combine: ensure lead guest is included as the first item if present.
-    # Try to detect if lead is already represented in 'party' exactly; if not, prepend.
-    def name_only_tuple(name: str) -> tuple[str, str, int | None]:
-        return (name, "", None)
+    # Ensure lead guest appears as Guest 1 (use lead_full_name when possible)
+    # Try to locate an entry matching lead name; otherwise, insert it at front.
+    lead_index = None
+    for i, (nm, _cat, _age) in enumerate(raw):
+        if nm and nm.lower() == lead_full_name.lower():
+            lead_index = i
+            break
+    if lead_index is None:
+        raw.insert(0, (lead_full_name, None, None))
+    elif lead_index != 0:
+        raw.insert(0, raw.pop(lead_index))
 
-    combined: list[tuple[str, str, int | None]] = []
-    if lead_full:
-        # Check if any member already has that exact name (case-insensitive)
-        has_lead = any((nm or "").strip().lower() == lead_full.lower() for (nm, _, _) in members)
-        if not has_lead:
-            combined.append(name_only_tuple(lead_full))
-    combined.extend(members)
+    # Decide whether to suppress the whole section if only lead has info
+    meaningful_others = any(
+        (nm or cat or age) and (nm.lower() != lead_full_name.lower())
+        for (nm, cat, age) in raw
+    )
+    if not meaningful_others:
+        return []  # skip the Party details section entirely
 
-    # Decide whether to show the section:
-    # If there's only one item and it's just the lead name with no category/age, omit the section.
-    if len(combined) == 1:
-        nm, cat, age_num = combined[0]
-        if (nm or "") and not cat and age_num is None:
-            return []
-
-    # Build lines: "Guest N: <name> – <category> – age X" (omit empty parts)
+    # Build lines "Guest N: ..."
     lines: list[str] = []
-    for idx, (nm, cat, age_num) in enumerate(combined, start=1):
-        parts: list[str] = []
-        if nm:
-            parts.append(nm)
-        if cat:
-            parts.append(cat)
-        if age_num is not None:
-            parts.append(f"age {age_num}")
-        text = " – ".join(parts) if parts else "Guest"
-        lines.append(f"Guest {idx}: {text}")
-
+    for idx, (nm, cat, age) in enumerate(raw, start=1):
+        label = nm if nm else (cat or "Guest")
+        if age:
+            line = f"Guest {idx}: {label} (age {age})"
+        else:
+            line = f"Guest {idx}: {label}"
+        lines.append(line)
     return lines
 
 # ---------- mapping ----------
@@ -319,7 +317,6 @@ def map_booking_to_event_data(b: dict) -> dict | None:
     party = _party_size(b)
 
     extras = _filter_extras(b.get("lines"))
-    party_lines = _party_descriptions(b)
 
     value = b.get("value")
     balance = b.get("balance")
@@ -330,6 +327,9 @@ def map_booking_to_event_data(b: dict) -> dict | None:
     channel = b.get("syndicate_name")
     currency = (b.get("currency") or "").upper() or None
 
+    # Keep the raw party array for rendering the section
+    party_raw = b.get("party") if isinstance(b.get("party"), list) else []
+
     return {
         "id": b.get("id"),
         "guest": guest,
@@ -338,7 +338,7 @@ def map_booking_to_event_data(b: dict) -> dict | None:
         "email": email,
         "phone": phone,
         "party": party,
-        "party_lines": party_lines,  # list[str]
+        "party_raw": party_raw,
         "extras": extras,
         "value": value,
         "balance": balance,
@@ -356,12 +356,12 @@ def _title_for_day(kind: str, guest: str, party: int | None, code: str) -> str:
     kind: "IN", "MID", "OUT"
     Only show xN on IN (and include x1).
     Always append property code in parentheses.
+    Use "0UT" (zero) to force it to sort before IN in most calendar clients.
     """
     if kind == "IN":
         suffix = f" x{party}" if party is not None else ""
         return f"IN: {guest}{suffix} ({code})"
     if kind == "OUT":
-        # NOTE: '0UT' (zero) to force lexical ordering before 'IN' in some clients
         return f"0UT: {guest} ({code})"
     return f"{guest} ({code})"  # MID
 
@@ -379,7 +379,7 @@ def _add_event(cal: Calendar, when: date, title: str, desc_lines: list[str], uid
     ev.add("description", "\n".join(desc_lines) if desc_lines else "Guest booking")
     cal.add_component(ev)
 
-def render_calendar(bookings: list[dict], calendar_name: str | None = None) -> bytes:
+def render_calendar(bookings: list[dict], calendar_name: str | None = None, include_mid: bool = True) -> bytes:
     cal = Calendar()
     cal.add("prodid", "-//Redroofs Bookster iCal//EN")
     cal.add("version", "2.0")
@@ -394,9 +394,15 @@ def render_calendar(bookings: list[dict], calendar_name: str | None = None) -> b
         code = _prop_code(mapped["entry_id"], mapped["entry_name"])
         days = _expand_stay_days(mapped["arrival"], mapped["departure"])
 
-        # days[0] is IN, days[-1] is OUT, any between are MID
+        # Build optional Party details section lines (excluding emails)
+        party_section = _parse_party_list(mapped.get("party_raw") or [], mapped["guest"])
+
+        # days[0] is IN, days[-1] is 0UT, any between are MID
         for i, day in enumerate(days):
             kind = "IN" if i == 0 else ("OUT" if i == len(days) - 1 else "MID")
+            if not include_mid and kind == "MID":
+                continue
+
             title = _title_for_day(kind, mapped["guest"], mapped["party"], code)
 
             desc: list[str] = []
@@ -408,12 +414,9 @@ def render_calendar(bookings: list[dict], calendar_name: str | None = None) -> b
                 desc.append(f"Guests in party: {mapped['party']}")
             if mapped["extras"]:
                 desc.append("Extras: " + ", ".join(mapped["extras"]))
-            # Party details block (only if present)
-            if mapped["party_lines"]:
+            if party_section:
                 desc.append("Party details")
-                for line in mapped["party_lines"]:
-                    desc.append(line)
-
+                desc.extend(party_section)
             if mapped["entry_name"]:
                 desc.append(f"Property: {mapped['entry_name']}")
             if mapped["channel"]:
@@ -436,11 +439,9 @@ def render_calendar(bookings: list[dict], calendar_name: str | None = None) -> b
 
 async def generate_and_write(property_ids: list[str], outdir: str = "public") -> list[str]:
     """
-    Generate one .ics per property. Steps:
-      1) List bookings by ei (entry_id), no server-side state filter.
-      2) Client-filter to confirmed.
-      3) Enrich each booking via detail endpoint (reliable value/balance/lines/phones/party).
-      4) Render to calendar, write <mapped filename>.ics and an index.html.
+    Generate two .ics per property:
+      - Full stays (IN, MID, 0UT)     -> BO-API.ics / RR-API.ics / BB-API.ics
+      - Check-in/out only (IN & 0UT)  -> BO-API-INOUT.ics / RR-API-INOUT.ics / BB-API-INOUT.ics
     """
     import traceback
     os.makedirs(outdir, exist_ok=True)
@@ -475,27 +476,42 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
                     break
             cal_name = cal_name or pid
 
-            ics_bytes = render_calendar(enriched, cal_name)
+            # Determine filenames (default to <pid>.ics if not mapped)
+            full_name, inout_name = PID_TO_FILENAMES.get(pid, (f"{pid}.ics", f"{pid}-INOUT.ics"))
 
-            # ---- write with mapped filename ----
-            filename = OUTPUT_FILENAMES.get(pid, f"{pid}.ics")
-            path = os.path.join(outdir, filename)
-            with open(path, "wb") as f:
-                f.write(ics_bytes)
-            written.append(path)
+            # 3a) Full calendar (IN/MID/0UT)
+            ics_full = render_calendar(enriched, cal_name, include_mid=True)
+            full_path = os.path.join(outdir, full_name)
+            with open(full_path, "wb") as f:
+                f.write(ics_full)
+            written.append(full_path)
+
+            # 3b) IN/OUT-only calendar
+            ics_inout = render_calendar(enriched, cal_name, include_mid=False)
+            inout_path = os.path.join(outdir, inout_name)
+            with open(inout_path, "wb") as f:
+                f.write(ics_inout)
+            written.append(inout_path)
 
         # index
         html = [
             "<h1>Redroofs iCal Feeds</h1>",
             "<p>Feeds regenerate hourly.</p>",
+            "<h2>Full stays (IN, MID, 0UT)</h2>",
         ]
         for pid in property_ids:
-            filename = OUTPUT_FILENAMES.get(pid, f"{pid}.ics")
-            html.append(f"<p><a href='{filename}'>{filename}</a></p>")
+            full_name, _ = PID_TO_FILENAMES.get(pid, (f"{pid}.ics", f"{pid}-INOUT.ics"))
+            html.append(f"<p><a href='{full_name}'>{full_name}</a></p>")
+        html.append("<h2>IN/OUT only</h2>")
+        for pid in property_ids:
+            _, inout_name = PID_TO_FILENAMES.get(pid, (f"{pid}.ics", f"{pid}-INOUT.ics"))
+            html.append(f"<p><a href='{inout_name}'>{inout_name}</a></p>")
+
         if DEBUG_DUMP and debug_lines:
             html.append("<hr><pre>")
             html.extend(debug_lines)
             html.append("</pre>")
+
         with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
             f.write("\n".join(html))
 
@@ -507,9 +523,10 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
             ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Redroofs Bookster iCal//EN", "END:VCALENDAR", ""]
         )
         for pid in property_ids:
-            filename = OUTPUT_FILENAMES.get(pid, f"{pid}.ics")
-            with open(os.path.join(outdir, filename), "w", encoding="utf-8") as f:
-                f.write(placeholder)
+            full_name, inout_name = PID_TO_FILENAMES.get(pid, (f"{pid}.ics", f"{pid}-INOUT.ics"))
+            for name in (full_name, inout_name):
+                with open(os.path.join(outdir, name), "w", encoding="utf-8") as f:
+                    f.write(placeholder)
         with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
             f.write(f"<h1>Redroofs iCal Feeds</h1>\n<pre>{e}</pre>")
         return written
