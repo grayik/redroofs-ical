@@ -1,4 +1,4 @@
-name: Build and publish iCal to GitHub Pages (hourly)
+name: Build and publish iCal + bookings.json to GitHub Pages (hourly)
 
 on:
   schedule:
@@ -29,7 +29,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install httpx icalendar python-dateutil
 
-      - name: Generate .ics files
+      - name: Generate .ics files and bookings.json
         env:
           BOOKSTER_API_BASE: https://app.booksterhq.com/system/api/v1
           BOOKSTER_BOOKINGS_PATH: booking/bookings.json
