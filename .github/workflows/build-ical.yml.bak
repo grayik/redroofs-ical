@@ -1,0 +1,61 @@
+name: Build and publish iCal to GitHub Pages (hourly)
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # hourly, UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx icalendar python-dateutil
+
+      - name: Generate .ics files
+        env:
+          BOOKSTER_API_BASE: https://app.booksterhq.com/system/api/v1
+          BOOKSTER_BOOKINGS_PATH: booking/bookings.json
+          BOOKSTER_API_KEY: ${{ secrets.BOOKSTER_API_KEY }}
+          DEBUG_DUMP: "0"   # set to "1" temporarily if you want to see debug on index.html
+        run: |
+          python - << 'PY'
+          import asyncio, pathlib
+          from app import generate_and_write
+          OUT = pathlib.Path("public"); OUT.mkdir(parents=True, exist_ok=True)
+          pids = ["158595","158596","158497"]
+          asyncio.run(generate_and_write(pids, str(OUT)))
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
