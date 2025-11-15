@@ -1,10 +1,11 @@
-# app.py — Bookster -> iCal generator (GitHub Actions build)
-# ----------------------------------------------------------
+# app.py — Bookster -> iCal + bookings.json generator (GitHub Actions build)
+# -------------------------------------------------------------------------
 # The GitHub Action imports `generate_and_write()` from this file.
 # It fetches bookings (list), enriches each one from the detail endpoint,
-# and writes two sets of .ics per property:
-#   1) Full: IN, MID, 0UT  -> BO-API.ics, RR-API.ics, BB-API.ics
-#   2) IN/OUT only         -> BO-API-INOUT.ics, RR-API-INOUT.ics, BB-API-INOUT.ics
+# and writes:
+#   1) Full iCal feeds: IN, MID, 0UT  -> BO-API.ics, RR-API.ics, BB-API.ics
+#   2) IN/OUT-only feeds             -> BO-API-INOUT.ics, RR-API-INOUT.ics, BB-API-INOUT.ics
+#   3) A merged bookings.json        -> single record per stay, for dashboard use.
 
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from icalendar import Calendar, Event
 from dateutil import parser as dtparse
 
 # ---------- configuration ----------
+
 BOOKSTER_API_BASE = os.getenv(
     "BOOKSTER_API_BASE",
     "https://app.booksterhq.com/system/api/v1",
@@ -51,6 +53,7 @@ EXTRA_ALLOWLIST = (
 
 AIRBNB_LABELS = {"adult", "child", "infant", "baby"}  # labels that often appear as "names"
 
+
 # ---------- helpers ----------
 
 def _to_date(v: t.Union[str, int, float, date, datetime, None]) -> date | None:
@@ -70,6 +73,7 @@ def _to_date(v: t.Union[str, int, float, date, datetime, None]) -> date | None:
     except Exception:
         return None
 
+
 def _best_phone(b: dict) -> str | None:
     """
     Prefer mobile, but fall back to day/evening or other fields seen in feeds.
@@ -86,6 +90,7 @@ def _best_phone(b: dict) -> str | None:
             return val
     return None
 
+
 def _party_size(b: dict) -> int | None:
     v = b.get("party_size")
     try:
@@ -94,6 +99,7 @@ def _party_size(b: dict) -> int | None:
         return int(v)
     except Exception:
         return None
+
 
 def _amount_paid(value: t.Any, balance: t.Any) -> float | None:
     try:
@@ -105,6 +111,7 @@ def _amount_paid(value: t.Any, balance: t.Any) -> float | None:
         return max(0.0, paid)
     except Exception:
         return None
+
 
 def _prop_code(entry_id: t.Any, entry_name: str | None) -> str:
     code = PROPERTY_CODES.get(str(entry_id or ""), "")
@@ -119,6 +126,7 @@ def _prop_code(entry_id: t.Any, entry_name: str | None) -> str:
         return "BB"
     return "RR"  # sensible default
 
+
 def _expand_stay_days(arrival: date, departure: date) -> list[date]:
     """
     Return the calendar days covered by the stay PLUS an explicit 0UT day.
@@ -131,6 +139,7 @@ def _expand_stay_days(arrival: date, departure: date) -> list[date]:
         cur += timedelta(days=1)
     days.append(departure)  # explicit 0UT day
     return days
+
 
 # ---------- API calls ----------
 
@@ -148,6 +157,7 @@ async def _bookster_get(client: httpx.AsyncClient, path: str, params: dict | Non
     r.raise_for_status()
     return r.json()
 
+
 async def fetch_list_for_property(property_id: str) -> list[dict]:
     """
     Fetch a booking list for an entry (property). We DO NOT pass st=confirmed
@@ -163,6 +173,7 @@ async def fetch_list_for_property(property_id: str) -> list[dict]:
             items = []
         return [b for b in items if (b.get("state") or "").lower() == "confirmed"]
 
+
 async def fetch_detail(booking_id: t.Union[str, int]) -> dict:
     """
     Get full details for a single booking (reliable value/balance/lines/phones/party).
@@ -173,6 +184,7 @@ async def fetch_detail(booking_id: t.Union[str, int]) -> dict:
         if isinstance(payload, dict):
             return payload
         return {}
+
 
 # ---------- party parsing ----------
 
@@ -195,12 +207,14 @@ def _filter_extras(lines: t.Any) -> list[str]:
                 picked.append(f"{name} x{qty}" if qty else name)
     return picked
 
+
 def _parse_party_list(party: t.Any, lead_full_name: str) -> list[str]:
     """
     Build lines like:
       Guest 1: Alice Smith
       Guest 2: Adult (age 34)
       Guest 3: Child
+
     Rules:
       - If a "name" is literally Adult/Child/Infant/Baby, treat that as the category (not a name).
       - Use 'type' only if it is one of those age categories; ignore 'standard'.
@@ -296,6 +310,7 @@ def _parse_party_list(party: t.Any, lead_full_name: str) -> list[str]:
         lines.append(line)
     return lines
 
+
 # ---------- mapping ----------
 
 def map_booking_to_event_data(b: dict) -> dict | None:
@@ -349,7 +364,14 @@ def map_booking_to_event_data(b: dict) -> dict | None:
         "channel": channel,
     }
 
-# ---------- iCal rendering ----------
+
+# ---------- description + iCal rendering helpers ----------
+
+def _booking_url(booking_id: t.Union[str, int, None]) -> str | None:
+    if not booking_id:
+        return None
+    return f"https://app.booksterhq.com/bookings/{booking_id}/view"
+
 
 def _title_for_day(kind: str, guest: str, party: int | None, code: str) -> str:
     """
@@ -365,10 +387,39 @@ def _title_for_day(kind: str, guest: str, party: int | None, code: str) -> str:
         return f"0UT: {guest} ({code})"
     return f"{guest} ({code})"  # MID
 
-def _booking_url(booking_id: t.Union[str, int, None]) -> str | None:
-    if not booking_id:
-        return None
-    return f"https://app.booksterhq.com/bookings/{booking_id}/view"
+
+def _description_lines(mapped: dict, party_section: list[str]) -> list[str]:
+    """
+    Build the description lines used in both:
+      - iCal event descriptions
+      - JSON 'notes' field for the dashboard
+    """
+    desc: list[str] = []
+    if mapped.get("email"):
+        desc.append(f"Email: {mapped['email']}")
+    if mapped.get("phone"):
+        desc.append(f"Mobile: {mapped['phone']}")
+    if mapped.get("party") is not None:
+        desc.append(f"Guests in party: {mapped['party']}")
+    if mapped.get("extras"):
+        desc.append("Extras: " + ", ".join(mapped["extras"]))
+    if party_section:
+        desc.append("Party details")
+        desc.extend(party_section)
+    if mapped.get("entry_name"):
+        desc.append(f"Property: {mapped['entry_name']}")
+    if mapped.get("channel"):
+        desc.append(f"Channel: {mapped['channel']}")
+    if mapped.get("paid") is not None:
+        amt = f"{mapped['paid']:.2f}"
+        if mapped.get("currency"):
+            amt = f"{mapped['currency']} {amt}"
+        desc.append(f"Amount paid to us: {amt}")
+    link = _booking_url(mapped.get("id"))
+    if link:
+        desc.append(f"Booking: {link}")
+    return desc
+
 
 def _add_event(cal: Calendar, when: date, title: str, desc_lines: list[str], uid: str) -> None:
     ev = Event()
@@ -379,7 +430,14 @@ def _add_event(cal: Calendar, when: date, title: str, desc_lines: list[str], uid
     ev.add("description", "\n".join(desc_lines) if desc_lines else "Guest booking")
     cal.add_component(ev)
 
+
 def render_calendar(bookings: list[dict], calendar_name: str | None = None, include_mid: bool = True) -> bytes:
+    """
+    Render an iCal calendar for a list of *raw* booking dicts.
+
+    Uses map_booking_to_event_data() internally, so it is safe to call this
+    with the enriched list.
+    """
     cal = Calendar()
     cal.add("prodid", "-//Redroofs Bookster iCal//EN")
     cal.add("version", "2.0")
@@ -396,6 +454,7 @@ def render_calendar(bookings: list[dict], calendar_name: str | None = None, incl
 
         # Build optional Party details section lines (excluding emails)
         party_section = _parse_party_list(mapped.get("party_raw") or [], mapped["guest"])
+        desc_lines = _description_lines(mapped, party_section)
 
         # days[0] is IN, days[-1] is 0UT, any between are MID
         for i, day in enumerate(days):
@@ -404,49 +463,31 @@ def render_calendar(bookings: list[dict], calendar_name: str | None = None, incl
                 continue
 
             title = _title_for_day(kind, mapped["guest"], mapped["party"], code)
-
-            desc: list[str] = []
-            if mapped["email"]:
-                desc.append(f"Email: {mapped['email']}")
-            if mapped["phone"]:
-                desc.append(f"Mobile: {mapped['phone']}")
-            if mapped["party"] is not None:
-                desc.append(f"Guests in party: {mapped['party']}")
-            if mapped["extras"]:
-                desc.append("Extras: " + ", ".join(mapped["extras"]))
-            if party_section:
-                desc.append("Party details")
-                desc.extend(party_section)
-            if mapped["entry_name"]:
-                desc.append(f"Property: {mapped['entry_name']}")
-            if mapped["channel"]:
-                desc.append(f"Channel: {mapped['channel']}")
-            if mapped["paid"] is not None:
-                amt = f"{mapped['paid']:.2f}"
-                if mapped["currency"]:
-                    amt = f"{mapped['currency']} {amt}"
-                desc.append(f"Amount paid to us: {amt}")
-            link = _booking_url(mapped["id"])
-            if link:
-                desc.append(f"Booking: {link}")
-
             uid = f"redroofs-{mapped['id']}-{kind}-{day.isoformat()}"
-            _add_event(cal, day, title, desc, uid)
+
+            _add_event(cal, day, title, desc_lines, uid)
 
     return cal.to_ical()
+
 
 # ---------- GitHub Action entry ----------
 
 async def generate_and_write(property_ids: list[str], outdir: str = "public") -> list[str]:
     """
-    Generate two .ics per property:
+    Generate outputs per property:
       - Full stays (IN, MID, 0UT)     -> BO-API.ics / RR-API.ics / BB-API.ics
       - Check-in/out only (IN & 0UT)  -> BO-API-INOUT.ics / RR-API-INOUT.ics / BB-API-INOUT.ics
+
+    And a single merged bookings.json with one record per stay, across ALL properties:
+      public/bookings.json
     """
+    import json
     import traceback
+
     os.makedirs(outdir, exist_ok=True)
     written: list[str] = []
     debug_lines: list[str] = []
+    json_rows: list[dict] = []
 
     try:
         for pid in property_ids:
@@ -493,7 +534,53 @@ async def generate_and_write(property_ids: list[str], outdir: str = "public") ->
                 f.write(ics_inout)
             written.append(inout_path)
 
-        # index
+            # 4) Append merged booking rows for bookings.json
+            for b in enriched:
+                mapped = map_booking_to_event_data(b)
+                if not mapped:
+                    continue
+
+                code = _prop_code(mapped["entry_id"], mapped["entry_name"])
+                party_section = _parse_party_list(mapped.get("party_raw") or [], mapped["guest"])
+                desc_lines = _description_lines(mapped, party_section)
+
+                # Arrival/departure as YYYY-MM-DD strings
+                start_str = mapped["arrival"].isoformat()
+                end_str = mapped["departure"].isoformat()
+
+                # Amount paid string, e.g. "GBP 524.50"
+                amount_str: str | None = None
+                if mapped.get("paid") is not None:
+                    amt = f"{mapped['paid']:.2f}"
+                    if mapped.get("currency"):
+                        amt = f"{mapped['currency']} {amt}"
+                    amount_str = amt
+
+                url = _booking_url(mapped.get("id"))
+
+                json_rows.append({
+                    "id": str(mapped["id"]) if mapped.get("id") is not None else None,
+                    "property": code,
+                    "guestName": mapped["guest"],
+                    "start": start_str,              # arrival (YYYY-MM-DD)
+                    "end": end_str,                  # departure / checkout (YYYY-MM-DD)
+                    "channel": mapped.get("channel"),
+                    "partySize": mapped.get("party"),
+                    "email": mapped.get("email"),
+                    "phone": mapped.get("phone"),
+                    "amountPaid": amount_str,
+                    "url": url,
+                    "notes": "\n".join(desc_lines),
+                })
+
+        # 5) Write bookings.json (merged stays for all properties)
+        bookings_path = os.path.join(outdir, "bookings.json")
+        with open(bookings_path, "w", encoding="utf-8") as f:
+            json.dump(json_rows, f, default=str, indent=2)
+        written.append(bookings_path)
+        debug_lines.append(f"bookings.json: {len(json_rows)} records")
+
+        # index.html (unchanged behaviour, just with optional debug)
         html = [
             "<h1>Redroofs iCal Feeds</h1>",
             "<p>Feeds regenerate hourly.</p>",
