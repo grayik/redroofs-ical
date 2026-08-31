@@ -44,6 +44,23 @@ jobs:
           asyncio.run(generate_and_write(pids, str(OUT)))
           PY
 
+      - name: Write heartbeat
+        run: |
+          python - << 'PY'
+          import json, os, pathlib
+          from datetime import datetime, timezone
+
+          heartbeat = {
+              "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+              "run_id": os.getenv("GITHUB_RUN_ID"),
+              "run_number": os.getenv("GITHUB_RUN_NUMBER"),
+          }
+          pathlib.Path("public/heartbeat.json").write_text(
+              json.dumps(heartbeat, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
