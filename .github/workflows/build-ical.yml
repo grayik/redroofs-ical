@@ -2,7 +2,7 @@ name: Build and publish iCal + bookings.json to GitHub Pages (hourly)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # hourly, UTC
+    - cron: "17 * * * *"   # hourly at 17 minutes past, UTC
   workflow_dispatch:
 
 permissions:
